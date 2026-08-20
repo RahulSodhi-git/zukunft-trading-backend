@@ -159,6 +159,11 @@ async function findUser(identifier) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.get("/health/db", asyncRoute(async (req, res) => {
+  const result = await query("select now() as server_time");
+  res.json({ ok: true, serverTime: result.rows[0].server_time });
+}));
+
 app.get("/countries", asyncRoute(async (req, res) => {
   const result = await query("select name from country_options order by is_default desc, name asc");
   res.json({ countries: result.rows.map(row => row.name) });
