@@ -32,6 +32,9 @@ export async function sendOtpEmail({ to, code, firstName, purpose = "account" })
     host: required("SMTP_HOST"),
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false").toLowerCase() === "true",
+    connectionTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
+    greetingTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
+    socketTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
     auth: {
       user: required("SMTP_USER"),
       pass: required("SMTP_PASS")
@@ -73,6 +76,9 @@ export async function sendAccountCreatedEmail({ to, firstName, customerNumber, a
     host: required("SMTP_HOST"),
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false").toLowerCase() === "true",
+    connectionTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
+    greetingTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
+    socketTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
     auth: {
       user: required("SMTP_USER"),
       pass: required("SMTP_PASS")

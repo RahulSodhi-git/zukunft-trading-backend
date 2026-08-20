@@ -172,6 +172,25 @@ app.get("/health/db", async (req, res) => {
   }
 });
 
+app.get("/health/email", async (req, res) => {
+  try {
+    await sendOtpEmail({
+      to: process.env.SMTP_USER,
+      code: "123456",
+      firstName: "Zukunft",
+      purpose: "login"
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      message: err.message,
+      code: err.code || null,
+      command: err.command || null
+    });
+  }
+});
+
 app.get("/countries", asyncRoute(async (req, res) => {
   const result = await query("select name from country_options order by is_default desc, name asc");
   res.json({ countries: result.rows.map(row => row.name) });
