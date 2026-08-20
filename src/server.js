@@ -159,10 +159,18 @@ async function findUser(identifier) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/health/db", asyncRoute(async (req, res) => {
-  const result = await query("select now() as server_time");
-  res.json({ ok: true, serverTime: result.rows[0].server_time });
-}));
+app.get("/health/db", async (req, res) => {
+  try {
+    const result = await query("select now() as server_time");
+    res.json({ ok: true, serverTime: result.rows[0].server_time });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      message: err.message,
+      code: err.code || null
+    });
+  }
+});
 
 app.get("/countries", asyncRoute(async (req, res) => {
   const result = await query("select name from country_options order by is_default desc, name asc");
