@@ -2,12 +2,14 @@ import nodemailer from "nodemailer";
 
 function required(name) {
   const value = process.env[name];
-  if (!value) throw new Error(`${name} is missing. Configure SMTP in .env to send OTP emails.`);
+  if (!value) throw new Error(`${name} is missing. Configure email delivery environment variables.`);
   return value;
 }
 
 export function hasEmailConfig() {
-  return process.env.EMAIL_DELIVERY_MODE === "console" || Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+  if (process.env.EMAIL_DELIVERY_MODE === "console") return true;
+  if (process.env.EMAIL_DELIVERY_MODE === "resend") return Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
+  return Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 }
 
 function labelForPurpose(purpose) {
@@ -17,15 +19,37 @@ function labelForPurpose(purpose) {
   return "account verification";
 }
 
-export async function sendOtpEmail({ to, code, firstName, purpose = "account" }) {
-  const label = labelForPurpose(purpose);
+async function sendEmail({ to, subject, text, html }) {
   if (process.env.EMAIL_DELIVERY_MODE === "console") {
-    console.log(`[Zukunft OTP] ${label} email=${to} code=${code}`);
+    console.log(`[Zukunft Email] to=${to} subject=${subject}`);
     return;
   }
 
   if (!hasEmailConfig()) {
-    throw new Error("Email OTP service is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and SMTP_FROM in .env.");
+    throw new Error("Email service is not configured. Add SMTP settings or RESEND_API_KEY and EMAIL_FROM.");
+  }
+
+  if (process.env.EMAIL_DELIVERY_MODE === "resend") {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${required("RESEND_API_KEY")}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: required("EMAIL_FROM"),
+        to,
+        subject,
+        text,
+        html
+      })
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Email provider rejected the message: ${body}`);
+    }
+    return;
   }
 
   const transporter = nodemailer.createTransport({
@@ -42,7 +66,16 @@ export async function sendOtpEmail({ to, code, firstName, purpose = "account" })
     }
   });
 
-  await transporter.sendMail({
+  await transporter.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, text, html });
+}
+
+export async function sendOtpEmail({ to, code, firstName, purpose = "account" }) {
+  const label = labelForPurpose(purpose);
+  if (process.env.EMAIL_DELIVERY_MODE === "console") {
+    console.log(`[Zukunft OTP] ${label} email=${to} code=${code}`);
+  }
+
+  await sendEmail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to,
     subject: `Your Zukunft Trading ${label} code`,
@@ -69,25 +102,7 @@ export async function sendAccountCreatedEmail({ to, firstName, customerNumber, a
     return;
   }
 
-  if (!hasEmailConfig()) {
-    throw new Error("Email service is not configured. Add SMTP settings in .env.");
-  }
-
-  const transporter = nodemailer.createTransport({
-    host: required("SMTP_HOST"),
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || "false").toLowerCase() === "true",
-    family: 4,
-    connectionTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
-    greetingTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
-    socketTimeout: Number(process.env.SMTP_TIMEOUT_MS || 15000),
-    auth: {
-      user: required("SMTP_USER"),
-      pass: required("SMTP_PASS")
-    }
-  });
-
-  await transporter.sendMail({
+  await sendEmail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to,
     subject: `Your Zukunft Trading ${planName} account is ready`,
