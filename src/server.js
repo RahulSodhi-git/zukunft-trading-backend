@@ -350,7 +350,11 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
     accountType: pending.account_type
   });
 
-  res.json({ token: issueToken(created.id), accountType: pending.account_type, customerNumber: created.customer_number });
+  res.json({
+    accountType: pending.account_type,
+    customerNumber: created.customer_number,
+    loginRequired: true
+  });
 }));
 
 app.post("/auth/login", asyncRoute(async (req, res) => {
@@ -360,7 +364,19 @@ app.post("/auth/login", asyncRoute(async (req, res) => {
   if (!data.password || !(await bcrypt.compare(data.password, user.password_hash))) {
     return res.status(401).json({ error: "Incorrect password." });
   }
-  res.json({ token: issueToken(user.id) });
+  let loginOtp;
+  try {
+    loginOtp = await createOtp(user.id, "login");
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message });
+  }
+  try {
+    await sendOtpEmail({ to: user.email, code: loginOtp, firstName: user.first_name, purpose: "login" });
+  } catch (err) {
+    await query("delete from otp_codes where user_id=$1 and target='login' and used_at is null", [user.id]);
+    return res.status(503).json({ error: err.message });
+  }
+  res.json({ userId: user.id, emailOtpSent: true, passwordVerified: true });
 }));
 
 app.post("/auth/request-login-otp", asyncRoute(async (req, res) => {
