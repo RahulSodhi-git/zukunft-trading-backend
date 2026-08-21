@@ -174,8 +174,9 @@ app.get("/health/db", async (req, res) => {
 
 app.get("/health/email", async (req, res) => {
   try {
+    const testTo = process.env.EMAIL_TEST_TO || process.env.SMTP_USER || "rstrading.zukunft@gmail.com";
     await sendOtpEmail({
-      to: process.env.SMTP_USER,
+      to: testTo,
       code: "123456",
       firstName: "Zukunft",
       purpose: "login"
