@@ -66,6 +66,13 @@ async function hash(value) {
 }
 
 async function createOtp(userId, target) {
+  await query(
+    "delete from otp_codes where (expires_at <= now() or used_at is not null) and created_at < now() - interval '10 minutes'"
+  );
+  await query(
+    "delete from otp_codes where user_id=$1 and target=$2 and expires_at <= now() and used_at is null",
+    [userId, target]
+  );
   const recent = await query(
     "select id from otp_codes where user_id=$1 and target=$2 and created_at > now() - interval '2 minutes' and used_at is null limit 1",
     [userId, target]
@@ -92,10 +99,27 @@ async function verifyHash(code, codeHash) {
   return bcrypt.compare(code, codeHash);
 }
 
-async function makeCustomerNumber(client, accountType) {
-  const prefix = accountType === "pro_live" ? "P" : "D";
+async function makeCustomerNumber(client) {
+  const dateParts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Berlin",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(dateParts.map(part => [part.type, part.value]));
+  const dateKey = `${byType.year}${byType.month}${byType.day}`;
+  const prefix = `A${dateKey}`;
+
   for (let i = 0; i < 8; i++) {
-    const number = `${prefix}${new Date().getFullYear()}${crypto.randomInt(100000, 999999)}`;
+    const latest = await client.query(
+      "select customer_number from users where customer_number like $1 order by length(customer_number) desc, customer_number desc limit 1",
+      [`${prefix}%`]
+    );
+    const lastNumber = latest.rows[0]?.customer_number || "";
+    const lastSequence = Number(lastNumber.slice(prefix.length)) || 0;
+    const nextSequence = lastSequence + 1 + i;
+    const sequenceWidth = Math.max(2, String(nextSequence).length);
+    const number = `${prefix}${String(nextSequence).padStart(sequenceWidth, "0")}`;
     const existing = await client.query("select id from users where customer_number=$1 limit 1", [number]);
     if (!existing.rows.length) return number;
   }
@@ -306,7 +330,7 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
       if (existingPhone.rows.length) throw new Error("Pro account already exists for this phone number.");
     }
 
-    const customerNumber = await makeCustomerNumber(client, pending.account_type);
+    const customerNumber = await makeCustomerNumber(client);
     const userResult = await client.query(
       `insert into users (customer_number, account_type, first_name, last_name, country, email, password_hash, email_verified, phone_verified, account_status)
        values ($1,$2,$3,$4,$5,$6,$7,true,$8,'active')
