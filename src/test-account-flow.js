@@ -1,6 +1,6 @@
 import bcrypt from "bcryptjs";
 import { app } from "./server.js";
-import { query } from "./db.js";
+import { pool, query } from "./db.js";
 
 function post(port, path, body) {
   return fetch(`http://127.0.0.1:${port}${path}`, {
@@ -41,6 +41,7 @@ const server = app.listen(0, async () => {
   const port = server.address().port;
   const email = `flow-${Date.now()}@example.com`;
   const expiredEmail = `expired-${Date.now()}@example.com`;
+  let exitCode = 0;
 
   try {
     const demoId = await createPending({ email, accountType: "starter_demo", emailOtp: "111111" });
@@ -75,9 +76,14 @@ const server = app.listen(0, async () => {
       expiredStatus: expiredResult.status,
       finalUsers: users.rows
     }, null, 2));
+  } catch (err) {
+    exitCode = 1;
+    console.error(err);
   } finally {
     await query("delete from users where email in ($1,$2)", [email, expiredEmail]);
     await query("delete from pending_signups where email in ($1,$2)", [email, expiredEmail]);
-    server.close();
+    await new Promise(resolve => server.close(resolve));
+    await pool.end();
+    process.exit(exitCode);
   }
 });
