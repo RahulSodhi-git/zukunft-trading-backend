@@ -221,6 +221,23 @@ app.get("/countries", asyncRoute(async (req, res) => {
   res.json({ countries: result.rows.map(row => row.name) });
 }));
 
+app.get("/public/performance", asyncRoute(async (req, res) => {
+  res.json({
+    connected: false,
+    updatedAt: null,
+    source: "main_bot",
+    metrics: {
+      dailyProfitLossPct: null,
+      winRatePct: null,
+      tradesToday: null,
+      backtestPassRatePct: null,
+      rulesChecked: null,
+      maxDrawdownPct: null
+    },
+    note: "Awaiting live bot metrics feed."
+  });
+}));
+
 app.post("/auth/signup", asyncRoute(async (req, res) => {
   const data = signupSchema.parse(req.body);
   const pro = data.accountType === "pro_live";
