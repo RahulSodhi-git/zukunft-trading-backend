@@ -52,6 +52,20 @@ const loginSchema = z.object({
   password: z.string().optional()
 });
 
+const apiKeySchema = z.object({
+  binanceApiKey: z.string().trim().min(16),
+  binanceApiSecret: z.string().trim().min(16),
+  coinalyzeApiKey: z.string().trim().min(12)
+});
+
+const capitalSchema = z.object({
+  capitalAmount: z.coerce.number().min(50)
+});
+
+const botToggleSchema = z.object({
+  action: z.enum(["start", "stop"])
+});
+
 function normalizePhoneCode(value) {
   const match = String(value || "").match(/\+\d+/);
   return match ? match[0] : String(value || "").trim();
@@ -143,6 +157,31 @@ function issueToken(userId) {
   return jwt.sign({ sub: userId }, jwtSecret, { expiresIn: "7d" });
 }
 
+async function ensureRuntimeSchema() {
+  await query(`
+    create table if not exists client_bot_setups (
+      user_id uuid primary key references users(id) on delete cascade,
+      binance_status text not null default 'not_connected',
+      binance_message text,
+      binance_checked_at timestamptz,
+      coinalyze_status text not null default 'not_connected',
+      coinalyze_message text,
+      coinalyze_checked_at timestamptz,
+      capital_amount numeric(18,2),
+      capital_currency text not null default 'USDT',
+      bot_status text not null default 'stopped',
+      bot_status_updated_at timestamptz,
+      setup_completed_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      check (binance_status in ('not_connected','verified','failed')),
+      check (coinalyze_status in ('not_connected','verified','failed')),
+      check (bot_status in ('stopped','running')),
+      check (capital_amount is null or capital_amount >= 50)
+    )
+  `);
+}
+
 function sendAccountCreatedLater({ email, firstName, customerNumber, accountType }) {
   const delayMs = Number(process.env.ACCOUNT_EMAIL_DELAY_MS || 60000);
   setTimeout(() => {
@@ -162,6 +201,58 @@ async function auth(req, res, next) {
   } catch {
     res.status(401).json({ error: "Unauthorized" });
   }
+}
+
+function cleanProviderMessage(value, fallback) {
+  const text = String(value || fallback || "Connection check failed.").replace(/\s+/g, " ").trim();
+  return text.slice(0, 180);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function verifyBinanceFutures(apiKey, apiSecret) {
+  const timestamp = Date.now();
+  const queryString = `timestamp=${timestamp}&recvWindow=5000`;
+  const signature = crypto.createHmac("sha256", apiSecret).update(queryString).digest("hex");
+  const url = `https://fapi.binance.com/fapi/v2/account?${queryString}&signature=${signature}`;
+  const response = await fetchWithTimeout(url, {
+    headers: { "X-MBX-APIKEY": apiKey }
+  });
+  if (response.ok) return { status: "verified", message: "Binance Futures connection verified. Withdrawal permission is not used." };
+  let body = {};
+  try { body = await response.json(); } catch {}
+  return {
+    status: "failed",
+    message: cleanProviderMessage(body.msg, `Binance rejected the key check with status ${response.status}.`)
+  };
+}
+
+async function verifyCoinalyze(apiKey) {
+  const response = await fetchWithTimeout("https://api.coinalyze.net/v1/exchanges", {
+    headers: { api_key: apiKey }
+  });
+  if (response.ok) return { status: "verified", message: "Coinalyze connection verified." };
+
+  let retryBody = "";
+  const retry = await fetchWithTimeout(`https://api.coinalyze.net/v1/exchanges?api_key=${encodeURIComponent(apiKey)}`);
+  if (retry.ok) return { status: "verified", message: "Coinalyze connection verified." };
+  try { retryBody = await retry.text(); } catch {}
+  return {
+    status: "failed",
+    message: cleanProviderMessage(retryBody, `Coinalyze rejected the key check with status ${retry.status || response.status}.`)
+  };
+}
+
+function setupComplete(row) {
+  return row?.binance_status === "verified" && row?.coinalyze_status === "verified" && Number(row?.capital_amount || 0) >= 50;
 }
 
 async function findUser(identifier) {
@@ -375,6 +466,7 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
     }
 
     await client.query("insert into client_profiles (user_id) values ($1)", [user.id]);
+    await client.query("insert into client_bot_setups (user_id) values ($1)", [user.id]);
     await client.query("insert into country_options (name) values ($1) on conflict (name) do nothing", [pending.country]);
     await client.query("delete from pending_signups where id=$1", [pending.id]);
     return {
@@ -454,15 +546,108 @@ app.get("/me", auth, asyncRoute(async (req, res) => {
             up.plan_code as account_type, up.status as plan_status, up.demo_started_at, up.demo_expires_at, up.pro_started_at,
             pp.date_of_birth, pp.phone_code, pp.phone_number, pp.phone_verified,
             case when pp.date_of_birth is null then null else date_part('year', age(current_date, pp.date_of_birth))::int end as age,
-            p.payment_status,p.onboarding_step,p.capital_amount,p.risk_level
+            p.payment_status,p.onboarding_step,p.risk_level,
+            s.binance_status,s.binance_message,s.binance_checked_at,
+            s.coinalyze_status,s.coinalyze_message,s.coinalyze_checked_at,
+            s.capital_amount,s.capital_currency,s.bot_status,s.bot_status_updated_at,s.setup_completed_at
      from users u
      left join user_plans up on up.user_id=u.id
      left join pro_profiles pp on pp.user_id=u.id
      left join client_profiles p on p.user_id=u.id
+     left join client_bot_setups s on s.user_id=u.id
      where u.id=$1`,
     [req.userId]
   );
   res.json({ user: result.rows[0] });
+}));
+
+app.get("/onboarding/status", auth, asyncRoute(async (req, res) => {
+  await query("insert into client_bot_setups (user_id) values ($1) on conflict (user_id) do nothing", [req.userId]);
+  const result = await query("select * from client_bot_setups where user_id=$1", [req.userId]);
+  const setup = result.rows[0];
+  res.json({ setup, setupComplete: setupComplete(setup) });
+}));
+
+app.post("/onboarding/api-keys", auth, asyncRoute(async (req, res) => {
+  const data = apiKeySchema.parse(req.body);
+  const [binance, coinalyze] = await Promise.all([
+    verifyBinanceFutures(data.binanceApiKey, data.binanceApiSecret).catch(err => ({
+      status: "failed",
+      message: cleanProviderMessage(err.message, "Binance connection check failed.")
+    })),
+    verifyCoinalyze(data.coinalyzeApiKey).catch(err => ({
+      status: "failed",
+      message: cleanProviderMessage(err.message, "Coinalyze connection check failed.")
+    }))
+  ]);
+
+  const result = await query(
+    `insert into client_bot_setups
+      (user_id, binance_status, binance_message, binance_checked_at, coinalyze_status, coinalyze_message, coinalyze_checked_at, updated_at)
+     values ($1,$2,$3,now(),$4,$5,now(),now())
+     on conflict (user_id) do update set
+       binance_status=excluded.binance_status,
+       binance_message=excluded.binance_message,
+       binance_checked_at=excluded.binance_checked_at,
+       coinalyze_status=excluded.coinalyze_status,
+       coinalyze_message=excluded.coinalyze_message,
+       coinalyze_checked_at=excluded.coinalyze_checked_at,
+       setup_completed_at=case
+         when excluded.binance_status='verified'
+          and excluded.coinalyze_status='verified'
+          and client_bot_setups.capital_amount >= 50
+         then coalesce(client_bot_setups.setup_completed_at, now())
+         else null
+       end,
+       updated_at=now()
+     returning *`,
+    [req.userId, binance.status, binance.message, coinalyze.status, coinalyze.message]
+  );
+
+  res.json({
+    setup: result.rows[0],
+    setupComplete: setupComplete(result.rows[0]),
+    note: "API keys were verified and discarded. Zukunft Trading does not store Binance or Coinalyze keys."
+  });
+}));
+
+app.post("/onboarding/capital", auth, asyncRoute(async (req, res) => {
+  const data = capitalSchema.parse(req.body);
+  const result = await query(
+    `insert into client_bot_setups (user_id, capital_amount, capital_currency, updated_at)
+     values ($1,$2,'USDT',now())
+     on conflict (user_id) do update set
+       capital_amount=excluded.capital_amount,
+       capital_currency='USDT',
+       setup_completed_at=case
+         when client_bot_setups.binance_status='verified'
+          and client_bot_setups.coinalyze_status='verified'
+          and excluded.capital_amount >= 50
+         then coalesce(client_bot_setups.setup_completed_at, now())
+         else null
+       end,
+       updated_at=now()
+     returning *`,
+    [req.userId, data.capitalAmount]
+  );
+  res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
+}));
+
+app.post("/bot/toggle", auth, asyncRoute(async (req, res) => {
+  const data = botToggleSchema.parse(req.body);
+  await query("insert into client_bot_setups (user_id) values ($1) on conflict (user_id) do nothing", [req.userId]);
+  const current = await query("select * from client_bot_setups where user_id=$1", [req.userId]);
+  if (data.action === "start" && !setupComplete(current.rows[0])) {
+    return res.status(409).json({ error: "Complete Binance, Coinalyze and minimum 50 USDT capital setup before starting the bot." });
+  }
+  const result = await query(
+    `update client_bot_setups
+     set bot_status=$2, bot_status_updated_at=now(), updated_at=now()
+     where user_id=$1
+     returning *`,
+    [req.userId, data.action === "start" ? "running" : "stopped"]
+  );
+  res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
 }));
 
 app.use((err, req, res, next) => {
@@ -474,7 +659,14 @@ app.use((err, req, res, next) => {
 export { app };
 
 if (process.argv[1] && process.argv[1].endsWith("server.js")) {
-  app.listen(port, () => {
-    console.log(`Zukunft Trading API running on http://localhost:${port}`);
-  });
+  ensureRuntimeSchema()
+    .then(() => {
+      app.listen(port, () => {
+        console.log(`Zukunft Trading API running on http://localhost:${port}`);
+      });
+    })
+    .catch(err => {
+      console.error("Startup schema check failed:", err);
+      process.exit(1);
+    });
 }

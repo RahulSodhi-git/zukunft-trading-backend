@@ -133,6 +133,27 @@ create table if not exists client_profiles (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists client_bot_setups (
+  user_id uuid primary key references users(id) on delete cascade,
+  binance_status text not null default 'not_connected',
+  binance_message text,
+  binance_checked_at timestamptz,
+  coinalyze_status text not null default 'not_connected',
+  coinalyze_message text,
+  coinalyze_checked_at timestamptz,
+  capital_amount numeric(18,2),
+  capital_currency text not null default 'USDT',
+  bot_status text not null default 'stopped',
+  bot_status_updated_at timestamptz,
+  setup_completed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (binance_status in ('not_connected','verified','failed')),
+  check (coinalyze_status in ('not_connected','verified','failed')),
+  check (bot_status in ('stopped','running')),
+  check (capital_amount is null or capital_amount >= 50)
+);
+
 create table if not exists country_options (
   name text primary key,
   is_default boolean not null default false,
