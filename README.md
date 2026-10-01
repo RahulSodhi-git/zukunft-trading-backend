@@ -1,6 +1,6 @@
 # Zukunft Trading Backend
 
-PostgreSQL-backed API for Pro signup, OTP verification, Stripe subscription payment and bot onboarding.
+PostgreSQL-backed API for Pro signup, OTP verification, one-time PayPal payment and bot onboarding.
 
 ## Current backend slice
 
@@ -8,7 +8,7 @@ The backend handles the complete Pro onboarding gate:
 
 - Pro Live signup creates a pending signup and creates the account only after email and phone OTP verification.
 - Login requires the password followed by an email OTP.
-- Stripe Checkout activates the $100/month Pro subscription.
+- PayPal Checkout activates Pro with a one-time $100 USD payment.
 - API verification, capital setup and bot controls require an active payment.
 - Customer numbers use `AyyyymmddNN` based on the Europe/Berlin business date.
 - Passwords are stored as bcrypt hashes, never as plain text.
@@ -74,9 +74,9 @@ SMTP_PASS=smtp password or app password
 SMTP_FROM="Zukunft Trading <no-reply@zukunfttrading.com>"
 SMS_WEBHOOK_URL=
 ACCOUNT_EMAIL_DELAY_MS=60000
-STRIPE_SECRET_KEY=sk_live_or_test_key
-STRIPE_PRICE_ID=price_optional_existing_100_usd_monthly_price
-STRIPE_WEBHOOK_SECRET=whsec_from_stripe_webhook
+PAYPAL_MODE=sandbox
+PAYPAL_CLIENT_ID=client_id_from_paypal_developer_dashboard
+PAYPAL_CLIENT_SECRET=client_secret_from_paypal_developer_dashboard
 ```
 
 After deployment, point the frontend API to:
@@ -85,20 +85,14 @@ After deployment, point the frontend API to:
 https://api.zukunfttrading.com
 ```
 
-Configure the Stripe webhook endpoint as:
-
-```text
-https://zukunft-trading-backend.onrender.com/payments/webhook
-```
-
-Subscribe it to `checkout.session.completed` and `customer.subscription.deleted`. If `STRIPE_PRICE_ID` is empty, the backend creates a $100 USD monthly line item directly in each Checkout Session.
+Start with `PAYPAL_MODE=sandbox` and sandbox credentials. After PayPal approves the live account and the sandbox flow passes, replace them with live credentials and set `PAYPAL_MODE=live`. The backend creates and captures the fixed $100 USD order on the server, then unlocks Pro only after PayPal returns a completed capture for the correct account and amount.
 
 ## Account tables
 
 - `users`: common account identity.
 - `pending_signups`: temporary unverified signup data.
-- `user_plans`: active Pro plan and subscription state. Legacy demo rows can remain for historical compatibility but cannot be created or used by the API.
+- `user_plans`: active Pro access state. Legacy demo rows can remain for historical compatibility but cannot be created or used by the API.
 - `pro_profiles`: Pro-only fields, created only for Pro users.
 - `otp_codes`: hashed email, phone and login OTPs.
-- `client_profiles`: payment state and Stripe references.
+- `client_profiles`: payment state and PayPal order/capture references. Legacy Stripe columns remain for database compatibility.
 - `client_bot_setups`: API connection status, capital and bot state. API secrets are never stored.

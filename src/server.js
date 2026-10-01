@@ -5,7 +5,6 @@ import dotenv from "dotenv";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
-import Stripe from "stripe";
 import { z } from "zod";
 import { query, transaction } from "./db.js";
 import { hasSmsConfig, sendAccountCreatedEmail, sendOtpEmail, sendPhoneOtp } from "./mailer.js";
@@ -15,7 +14,6 @@ dotenv.config();
 const app = express();
 const port = Number(process.env.PORT || 5050);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 const otpTtlMinutes = 2;
 const frontendOrigins = String(process.env.FRONTEND_ORIGIN || "http://localhost:5500,http://127.0.0.1:5500")
   .split(",")
@@ -32,48 +30,59 @@ app.use(cors({
   }
 }));
 
-app.post("/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-    return res.status(503).json({ error: "Stripe webhook is not configured." });
-  }
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers["stripe-signature"],
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    if (event.type === "checkout.session.completed") {
-      await activatePaymentFromCheckout(event.data.object);
-    } else if (event.type === "customer.subscription.deleted") {
-      const subscription = event.data.object;
-      const userId = subscription.metadata?.userId;
-      if (userId) {
-        await query(
-          `update client_profiles
-           set payment_status='inactive', onboarding_step='payment', updated_at=now()
-           where user_id=$1`,
-          [userId]
-        );
-      }
-    }
-    res.json({ received: true });
-  } catch (err) {
-    console.error("Stripe webhook processing failed:", err.message);
-    res.status(500).json({ error: "Webhook processing failed." });
-  }
-});
-
 app.use(express.json({ limit: "64kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 40 }));
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+function hasPayPalConfig() {
+  return Boolean(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
+}
+
+function paypalBaseUrl() {
+  return String(process.env.PAYPAL_MODE || "sandbox").toLowerCase() === "live"
+    ? "https://api-m.paypal.com"
+    : "https://api-m.sandbox.paypal.com";
+}
+
+async function paypalAccessToken() {
+  if (!hasPayPalConfig()) throw new Error("PayPal is not configured.");
+  const credentials = Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`).toString("base64");
+  const response = await fetch(`${paypalBaseUrl()}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
+  const data = await response.json();
+  if (!response.ok || !data.access_token) throw new Error(data.error_description || "PayPal authentication failed.");
+  return data.access_token;
+}
+
+async function paypalRequest(path, { method = "GET", body, requestId } = {}) {
+  const accessToken = await paypalAccessToken();
+  const response = await fetch(`${paypalBaseUrl()}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+      ...(requestId ? { "PayPal-Request-Id": requestId } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const detail = data.details?.[0]?.description || data.message || "PayPal request failed.";
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
 }
 
 const signupSchema = z.object({
@@ -254,6 +263,8 @@ async function ensureRuntimeSchema() {
   await query(`alter table client_profiles add column if not exists stripe_subscription_id text`);
   await query(`alter table client_profiles add column if not exists stripe_checkout_session_id text`);
   await query(`alter table client_profiles add column if not exists paid_at timestamptz`);
+  await query(`alter table client_profiles add column if not exists paypal_order_id text`);
+  await query(`alter table client_profiles add column if not exists paypal_capture_id text`);
   legacyAccountCleanup = await transaction(async client => {
     await client.query(`
       create table if not exists system_migrations (
@@ -279,23 +290,24 @@ async function ensureRuntimeSchema() {
   });
 }
 
-async function activatePaymentFromCheckout(session) {
-  const userId = session.client_reference_id || session.metadata?.userId;
+async function activatePayPalOrder(order, userId) {
+  const purchase = order.purchase_units?.[0];
+  const capture = purchase?.payments?.captures?.find(item => item.status === "COMPLETED");
   if (
-    !userId ||
-    session.mode !== "subscription" ||
-    session.payment_status !== "paid" ||
-    session.currency !== "usd" ||
-    Number(session.amount_total) !== 10000 ||
-    session.metadata?.plan !== "pro_live"
+    order.status !== "COMPLETED" ||
+    purchase?.custom_id !== userId ||
+    purchase?.amount?.currency_code !== "USD" ||
+    purchase?.amount?.value !== "100.00" ||
+    capture?.amount?.currency_code !== "USD" ||
+    capture?.amount?.value !== "100.00"
   ) return false;
   await query(
     `update client_profiles
-     set payment_status='active', onboarding_step='api_setup', stripe_customer_id=$2,
-         stripe_subscription_id=$3, stripe_checkout_session_id=$4,
+     set payment_status='active', onboarding_step='api_setup', paypal_order_id=$2,
+         paypal_capture_id=$3,
          paid_at=coalesce(paid_at,now()), updated_at=now()
      where user_id=$1`,
-    [userId, session.customer || null, session.subscription || null, session.id]
+    [userId, order.id, capture.id]
   );
   await query("update users set account_status='active', updated_at=now() where id=$1", [userId]);
   await query(
@@ -331,7 +343,7 @@ async function requireActivePayment(req, res, next) {
   try {
     const result = await query("select payment_status from client_profiles where user_id=$1", [req.userId]);
     if (result.rows[0]?.payment_status !== "active") {
-      return res.status(402).json({ error: "Activate the $100/month Pro subscription before continuing." });
+      return res.status(402).json({ error: "Complete the one-time $100 Pro activation payment before continuing." });
     }
     next();
   } catch (err) {
@@ -672,15 +684,16 @@ app.get("/payments/status", auth, asyncRoute(async (req, res) => {
     plan: "pro_live",
     amount: 100,
     currency: "USD",
-    interval: "month",
+    interval: "one_time",
     status: payment.payment_status,
     paidAt: payment.paid_at,
-    checkoutConfigured: Boolean(stripe)
+    checkoutConfigured: hasPayPalConfig(),
+    provider: "paypal"
   });
 }));
 
 app.post("/payments/checkout", auth, asyncRoute(async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "Payments are not configured yet. Add STRIPE_SECRET_KEY in Render." });
+  if (!hasPayPalConfig()) return res.status(503).json({ error: "Payments are not configured yet. Add the PayPal Client ID and Secret in Render." });
   const userResult = await query(
     `select u.id,u.email,u.customer_number,p.payment_status
      from users u join client_profiles p on p.user_id=u.id
@@ -691,42 +704,68 @@ app.post("/payments/checkout", auth, asyncRoute(async (req, res) => {
   if (!user) return res.status(404).json({ error: "Pro account not found." });
   if (user.payment_status === "active") return res.json({ active: true, redirectUrl: `${publicFrontendUrl}/portal.html` });
 
-  const lineItem = process.env.STRIPE_PRICE_ID
-    ? { price: process.env.STRIPE_PRICE_ID, quantity: 1 }
-    : {
-        price_data: {
-          currency: "usd",
-          unit_amount: 10000,
-          recurring: { interval: "month" },
-          product_data: { name: "Zukunft Trading Pro" }
+  let order;
+  try {
+    order = await paypalRequest("/v2/checkout/orders", {
+      method: "POST",
+      requestId: crypto.randomUUID(),
+      body: {
+        intent: "CAPTURE",
+        payment_source: {
+          paypal: {
+            experience_context: {
+              brand_name: "Zukunft Trading",
+              shipping_preference: "NO_SHIPPING",
+              user_action: "PAY_NOW",
+              return_url: `${publicFrontendUrl}/payment.html`,
+              cancel_url: `${publicFrontendUrl}/payment.html?cancelled=1`
+            }
+          }
         },
-        quantity: 1
-      };
-  const session = await stripe.checkout.sessions.create({
-    mode: "subscription",
-    customer_email: user.email,
-    client_reference_id: user.id,
-    line_items: [lineItem],
-    success_url: `${publicFrontendUrl}/payment.html?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${publicFrontendUrl}/payment.html?cancelled=1`,
-    metadata: { userId: user.id, customerNumber: user.customer_number, plan: "pro_live" },
-    subscription_data: { metadata: { userId: user.id, plan: "pro_live" } }
-  });
+        purchase_units: [{
+          reference_id: "ZUKUNFT_PRO",
+          custom_id: user.id,
+          invoice_id: `${user.customer_number}-${Date.now()}`,
+          description: "Zukunft Trading Pro one-time activation",
+          amount: { currency_code: "USD", value: "100.00" }
+        }]
+      }
+    });
+  } catch (err) {
+    console.error("PayPal order creation failed:", err.message);
+    return res.status(502).json({ error: "PayPal could not start the payment. Please try again." });
+  }
+  const approvalUrl = order.links?.find(link => link.rel === "payer-action" || link.rel === "approve")?.href;
+  if (!approvalUrl) return res.status(502).json({ error: "PayPal did not return a checkout link." });
   await query(
-    `update client_profiles set payment_status='pending', stripe_checkout_session_id=$2, updated_at=now() where user_id=$1`,
-    [req.userId, session.id]
+    `update client_profiles set payment_status='pending', paypal_order_id=$2, updated_at=now() where user_id=$1`,
+    [req.userId, order.id]
   );
-  res.status(201).json({ checkoutUrl: session.url });
+  res.status(201).json({ checkoutUrl: approvalUrl, orderId: order.id });
 }));
 
 app.post("/payments/confirm", auth, asyncRoute(async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "Payments are not configured." });
-  const data = z.object({ sessionId: z.string().min(8) }).parse(req.body);
-  const session = await stripe.checkout.sessions.retrieve(data.sessionId);
-  const sessionUserId = session.client_reference_id || session.metadata?.userId;
-  if (sessionUserId !== req.userId) return res.status(403).json({ error: "Payment session does not belong to this account." });
-  const active = await activatePaymentFromCheckout(session);
-  res.json({ active, status: active ? "active" : session.payment_status });
+  if (!hasPayPalConfig()) return res.status(503).json({ error: "Payments are not configured." });
+  const data = z.object({ orderId: z.string().min(8).max(64) }).parse(req.body);
+  const payment = await query("select paypal_order_id,payment_status from client_profiles where user_id=$1", [req.userId]);
+  if (payment.rows[0]?.payment_status === "active") return res.json({ active: true, status: "active" });
+  if (payment.rows[0]?.paypal_order_id !== data.orderId) return res.status(403).json({ error: "Payment order does not belong to this account." });
+
+  let order;
+  try {
+    order = await paypalRequest(`/v2/checkout/orders/${encodeURIComponent(data.orderId)}/capture`, {
+      method: "POST",
+      requestId: `capture-${data.orderId}`
+    });
+  } catch (err) {
+    if (err.status !== 422) {
+      console.error("PayPal capture failed:", err.message);
+      return res.status(502).json({ error: "PayPal has not completed the payment. Please try again." });
+    }
+    order = await paypalRequest(`/v2/checkout/orders/${encodeURIComponent(data.orderId)}`);
+  }
+  const active = await activatePayPalOrder(order, req.userId);
+  res.json({ active, status: active ? "active" : order.status });
 }));
 
 app.get("/me", auth, asyncRoute(async (req, res) => {

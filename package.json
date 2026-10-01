@@ -10,7 +10,8 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "db:migrate": "node src/migrate.js",
-    "test:account": "node src/test-account-flow.js"
+    "test:account": "node src/test-account-flow.js",
+    "test:paypal": "node src/test-paypal-flow.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -21,7 +22,6 @@
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^10.0.13",
     "pg": "^8.13.1",
-    "stripe": "^23.0.0",
     "zod": "^3.24.1"
   }
 }

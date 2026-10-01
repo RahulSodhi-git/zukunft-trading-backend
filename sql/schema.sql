@@ -159,6 +159,8 @@ create table if not exists client_profiles (
   stripe_customer_id text,
   stripe_subscription_id text,
   stripe_checkout_session_id text,
+  paypal_order_id text,
+  paypal_capture_id text,
   paid_at timestamptz,
   capital_amount numeric(18,2),
   risk_level text,
@@ -169,6 +171,8 @@ create table if not exists client_profiles (
 alter table client_profiles add column if not exists stripe_customer_id text;
 alter table client_profiles add column if not exists stripe_subscription_id text;
 alter table client_profiles add column if not exists stripe_checkout_session_id text;
+alter table client_profiles add column if not exists paypal_order_id text;
+alter table client_profiles add column if not exists paypal_capture_id text;
 alter table client_profiles add column if not exists paid_at timestamptz;
 
 create table if not exists client_bot_setups (
