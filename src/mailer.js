@@ -13,7 +13,6 @@ export function hasEmailConfig() {
 }
 
 function labelForPurpose(purpose) {
-  if (purpose === "starter_demo_signup") return "Free Demo account verification";
   if (purpose === "pro_live_signup") return "Pro Live account verification";
   if (purpose === "login") return "login verification";
   return "account verification";
@@ -96,7 +95,7 @@ export async function sendOtpEmail({ to, code, firstName, purpose = "account" })
 }
 
 export async function sendAccountCreatedEmail({ to, firstName, customerNumber, accountType }) {
-  const planName = accountType === "pro_live" ? "Pro Live" : "Free Demo";
+  const planName = "Pro Live";
   if (process.env.EMAIL_DELIVERY_MODE === "console") {
     console.log(`[Zukunft Account] ${planName} email=${to} customer=${customerNumber}`);
     return;

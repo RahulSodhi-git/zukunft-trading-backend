@@ -3,7 +3,7 @@ create extension if not exists pgcrypto;
 create table if not exists users (
   id uuid primary key default gen_random_uuid(),
   customer_number text unique,
-  account_type text not null default 'starter_demo' check (account_type in ('starter_demo','pro_live')),
+  account_type text not null default 'pro_live' check (account_type in ('starter_demo','pro_live')),
   first_name text not null,
   last_name text not null,
   country text not null,
@@ -36,7 +36,8 @@ end $$;
 
 alter table users add column if not exists phone_verified boolean not null default false;
 alter table users add column if not exists customer_number text unique;
-alter table users add column if not exists account_type text not null default 'starter_demo';
+alter table users add column if not exists account_type text not null default 'pro_live';
+alter table users alter column account_type set default 'pro_live';
 alter table users drop column if exists date_of_birth;
 alter table users drop column if exists phone;
 alter table users drop column if exists phone_code;
@@ -127,11 +128,20 @@ create table if not exists client_profiles (
   user_id uuid primary key references users(id) on delete cascade,
   payment_status text not null default 'not_started',
   onboarding_step text not null default 'account_verification',
+  stripe_customer_id text,
+  stripe_subscription_id text,
+  stripe_checkout_session_id text,
+  paid_at timestamptz,
   capital_amount numeric(18,2),
   risk_level text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table client_profiles add column if not exists stripe_customer_id text;
+alter table client_profiles add column if not exists stripe_subscription_id text;
+alter table client_profiles add column if not exists stripe_checkout_session_id text;
+alter table client_profiles add column if not exists paid_at timestamptz;
 
 create table if not exists client_bot_setups (
   user_id uuid primary key references users(id) on delete cascade,

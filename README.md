@@ -1,16 +1,16 @@
 # Zukunft Trading Backend
 
-Local PostgreSQL-backed API for client signup, OTP verification and login.
+PostgreSQL-backed API for Pro signup, OTP verification, Stripe subscription payment and bot onboarding.
 
 ## Current backend slice
 
-This backend currently handles the account layer only:
+The backend handles the complete Pro onboarding gate:
 
-- Free Demo signup: stores a pending signup first, sends email OTP, then creates the account only after email OTP is correct.
-- Pro Live signup: stores a pending signup first, then creates the account only after email OTP and phone OTP are both correct.
-- Free Demo account: first name, last name, country, email, password hash, 2-day demo plan, customer number starting with `D`.
-- Pro Live account: common user row plus Pro profile with DOB and phone, customer number starting with `P`.
-- The same email can have one Demo account and one Pro account. Duplicate Demo-for-same-email or duplicate Pro-for-same-email is blocked.
+- Pro Live signup creates a pending signup and creates the account only after email and phone OTP verification.
+- Login requires the password followed by an email OTP.
+- Stripe Checkout activates the $100/month Pro subscription.
+- API verification, capital setup and bot controls require an active payment.
+- Customer numbers use `AyyyymmddNN` based on the Europe/Berlin business date.
 - Passwords are stored as bcrypt hashes, never as plain text.
 - Binance API keys are not stored in the database.
 - Only one signup OTP request is allowed per email every 2 minutes.
@@ -65,6 +65,7 @@ DATABASE_URL=postgres://...
 JWT_SECRET=use-a-long-random-secret
 FRONTEND_ORIGIN=https://zukunfttrading.com,https://www.zukunfttrading.com
 EMAIL_DELIVERY_MODE=smtp
+PUBLIC_FRONTEND_URL=https://zukunfttrading.com
 SMTP_HOST=smtp provider host
 SMTP_PORT=587
 SMTP_SECURE=false
@@ -73,6 +74,9 @@ SMTP_PASS=smtp password or app password
 SMTP_FROM="Zukunft Trading <no-reply@zukunfttrading.com>"
 SMS_WEBHOOK_URL=
 ACCOUNT_EMAIL_DELAY_MS=60000
+STRIPE_SECRET_KEY=sk_live_or_test_key
+STRIPE_PRICE_ID=price_optional_existing_100_usd_monthly_price
+STRIPE_WEBHOOK_SECRET=whsec_from_stripe_webhook
 ```
 
 After deployment, point the frontend API to:
@@ -81,10 +85,20 @@ After deployment, point the frontend API to:
 https://api.zukunfttrading.com
 ```
 
+Configure the Stripe webhook endpoint as:
+
+```text
+https://zukunft-trading-backend.onrender.com/payments/webhook
+```
+
+Subscribe it to `checkout.session.completed` and `customer.subscription.deleted`. If `STRIPE_PRICE_ID` is empty, the backend creates a $100 USD monthly line item directly in each Checkout Session.
+
 ## Account tables
 
 - `users`: common account identity.
 - `pending_signups`: temporary unverified signup data.
-- `user_plans`: `starter_demo` or `pro_live`, including demo expiry.
+- `user_plans`: active Pro plan and subscription state. Legacy demo rows can remain for historical compatibility but cannot be created or used by the API.
 - `pro_profiles`: Pro-only fields, created only for Pro users.
 - `otp_codes`: hashed email, phone and login OTPs.
+- `client_profiles`: payment state and Stripe references.
+- `client_bot_setups`: API connection status, capital and bot state. API secrets are never stored.

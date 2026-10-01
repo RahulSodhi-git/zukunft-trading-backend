@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
+import Stripe from "stripe";
 import { z } from "zod";
 import { query, transaction } from "./db.js";
 import { hasSmsConfig, sendAccountCreatedEmail, sendOtpEmail, sendPhoneOtp } from "./mailer.js";
@@ -14,19 +15,59 @@ dotenv.config();
 const app = express();
 const port = Number(process.env.PORT || 5050);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 const otpTtlMinutes = 2;
-const frontendOrigins = String(process.env.FRONTEND_ORIGIN || "null")
+const frontendOrigins = String(process.env.FRONTEND_ORIGIN || "http://localhost:5500,http://127.0.0.1:5500")
   .split(",")
   .map(origin => origin.trim())
   .filter(Boolean);
+const publicFrontendUrl = String(process.env.PUBLIC_FRONTEND_URL || frontendOrigins.find(origin => origin !== "null") || "http://localhost:5500").replace(/\/$/, "");
 
 app.set("trust proxy", 1);
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || frontendOrigins.includes("null") || frontendOrigins.includes(origin)) cb(null, true);
+    if (!origin || frontendOrigins.includes(origin)) cb(null, true);
     else cb(new Error("Origin not allowed"));
   }
 }));
+
+app.post("/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: "Stripe webhook is not configured." });
+  }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      await activatePaymentFromCheckout(event.data.object);
+    } else if (event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object;
+      const userId = subscription.metadata?.userId;
+      if (userId) {
+        await query(
+          `update client_profiles
+           set payment_status='inactive', onboarding_step='payment', updated_at=now()
+           where user_id=$1`,
+          [userId]
+        );
+      }
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Stripe webhook processing failed:", err.message);
+    res.status(500).json({ error: "Webhook processing failed." });
+  }
+});
+
 app.use(express.json({ limit: "64kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 40 }));
 
@@ -35,8 +76,7 @@ function asyncRoute(handler) {
 }
 
 const signupSchema = z.object({
-  accountType: z.enum(["starter_demo", "pro_live"]).default("starter_demo"),
-  demoExpiresInDays: z.number().int().positive().max(30).nullable().optional(),
+  accountType: z.literal("pro_live").default("pro_live"),
   firstName: z.string().trim().min(1),
   lastName: z.string().trim().min(1),
   dob: z.string().min(8).nullable().optional(),
@@ -180,6 +220,37 @@ async function ensureRuntimeSchema() {
       check (capital_amount is null or capital_amount >= 50)
     )
   `);
+  await query(`alter table client_profiles add column if not exists stripe_customer_id text`);
+  await query(`alter table client_profiles add column if not exists stripe_subscription_id text`);
+  await query(`alter table client_profiles add column if not exists stripe_checkout_session_id text`);
+  await query(`alter table client_profiles add column if not exists paid_at timestamptz`);
+}
+
+async function activatePaymentFromCheckout(session) {
+  const userId = session.client_reference_id || session.metadata?.userId;
+  if (
+    !userId ||
+    session.mode !== "subscription" ||
+    session.payment_status !== "paid" ||
+    session.currency !== "usd" ||
+    Number(session.amount_total) !== 10000 ||
+    session.metadata?.plan !== "pro_live"
+  ) return false;
+  await query(
+    `update client_profiles
+     set payment_status='active', onboarding_step='api_setup', stripe_customer_id=$2,
+         stripe_subscription_id=$3, stripe_checkout_session_id=$4,
+         paid_at=coalesce(paid_at,now()), updated_at=now()
+     where user_id=$1`,
+    [userId, session.customer || null, session.subscription || null, session.id]
+  );
+  await query("update users set account_status='active', updated_at=now() where id=$1", [userId]);
+  await query(
+    `update user_plans set status='active', pro_started_at=coalesce(pro_started_at,now()), updated_at=now()
+     where user_id=$1 and plan_code='pro_live'`,
+    [userId]
+  );
+  return true;
 }
 
 function sendAccountCreatedLater({ email, firstName, customerNumber, accountType }) {
@@ -200,6 +271,18 @@ async function auth(req, res, next) {
     next();
   } catch {
     res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+async function requireActivePayment(req, res, next) {
+  try {
+    const result = await query("select payment_status from client_profiles where user_id=$1", [req.userId]);
+    if (result.rows[0]?.payment_status !== "active") {
+      return res.status(402).json({ error: "Activate the $100/month Pro subscription before continuing." });
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
 }
 
@@ -261,11 +344,13 @@ async function findUser(identifier) {
     `select u.*
      from users u
      left join pro_profiles pp on pp.user_id = u.id
-     where lower(u.email)=$1
-        or lower(u.customer_number)=$1
-        or lower(concat_ws(' ', pp.phone_code, pp.phone_number))=$1
-        or lower(pp.phone_number)=$1
-     order by case when u.account_type='pro_live' then 0 else 1 end, u.created_at desc
+     where (
+       lower(u.email)=$1
+       or lower(u.customer_number)=$1
+       or lower(concat_ws(' ', pp.phone_code, pp.phone_number))=$1
+       or lower(pp.phone_number)=$1
+     ) and u.account_type='pro_live'
+     order by u.created_at desc
      limit 1`,
     [value]
   );
@@ -331,17 +416,16 @@ app.get("/public/performance", asyncRoute(async (req, res) => {
 
 app.post("/auth/signup", asyncRoute(async (req, res) => {
   const data = signupSchema.parse(req.body);
-  const pro = data.accountType === "pro_live";
-  const phoneCode = pro ? normalizePhoneCode(data.phoneCode) : null;
-  if (pro && (!data.dob || !data.phoneCode || !data.phone)) {
+  const phoneCode = normalizePhoneCode(data.phoneCode);
+  if (!data.dob || !data.phoneCode || !data.phone) {
     return res.status(400).json({ error: "Pro account requires date of birth, phone extension and mobile number." });
   }
-  if (pro && !hasSmsConfig()) {
+  if (!hasSmsConfig()) {
     return res.status(503).json({ error: "Phone OTP service is not configured. Pro signup needs SMS verification before account creation." });
   }
 
   const existingEmail = await query("select id from users where lower(email)=$1 and account_type=$2 limit 1", [data.email, data.accountType]);
-  if (existingEmail.rows.length) return res.status(409).json({ error: `${pro ? "Pro" : "Demo"} account already exists for this email.` });
+  if (existingEmail.rows.length) return res.status(409).json({ error: "Pro account already exists for this email." });
 
   await query("delete from pending_signups where expires_at <= now()");
 
@@ -353,17 +437,15 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
     return res.status(429).json({ error: "OTP already requested. Please wait 2 minutes before requesting a new code." });
   }
 
-  if (pro) {
-    const existingPhone = await query(
-      "select user_id from pro_profiles where lower(phone_code)=lower($1) and lower(phone_number)=lower($2) limit 1",
-      [phoneCode, data.phone]
-    );
-    if (existingPhone.rows.length) return res.status(409).json({ error: "Pro account already exists for this phone number." });
-  }
+  const existingPhone = await query(
+    "select user_id from pro_profiles where lower(phone_code)=lower($1) and lower(phone_number)=lower($2) limit 1",
+    [phoneCode, data.phone]
+  );
+  if (existingPhone.rows.length) return res.status(409).json({ error: "Pro account already exists for this phone number." });
 
   const passwordHash = await hash(data.password);
   const emailOtp = makeOtp();
-  const phoneOtp = pro ? makeOtp() : null;
+  const phoneOtp = makeOtp();
   const result = await query(
     `insert into pending_signups
       (account_type, first_name, last_name, country, email, password_hash, date_of_birth, phone_code, phone_number,
@@ -377,9 +459,9 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
       data.country,
       data.email,
       passwordHash,
-      pro ? data.dob : null,
+      data.dob,
       phoneCode,
-      pro ? data.phone : null,
+      data.phone,
       await hashOtp(emailOtp),
       phoneOtp ? await hashOtp(phoneOtp) : null,
       otpTtlMinutes
@@ -392,11 +474,9 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
       to: pending.email,
       code: emailOtp,
       firstName: data.firstName,
-      purpose: data.accountType === "pro_live" ? "pro_live_signup" : "starter_demo_signup"
+      purpose: "pro_live_signup"
     });
-    if (pro) {
-      await sendPhoneOtp({ to: `${phoneCode}${data.phone}`, code: phoneOtp });
-    }
+    await sendPhoneOtp({ to: `${phoneCode}${data.phone}`, code: phoneOtp });
   } catch (err) {
     await query("delete from pending_signups where id=$1", [pending.id]);
     return res.status(503).json({ error: err.message });
@@ -404,11 +484,9 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
   res.status(201).json({
     signupRequestId: pending.id,
     email: pending.email,
-    accountType: data.accountType,
-    demoExpiresInDays: data.accountType === "starter_demo" ? 2 : null,
+    accountType: "pro_live",
     emailOtpSent: true,
-    phoneOtpSent: Boolean(phoneOtp),
-    demoMode: true
+    phoneOtpSent: true
   });
 }));
 
@@ -424,24 +502,23 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
   }
 
   const emailOk = await verifyHash(data.emailOtp, pending.email_otp_hash);
-  const phoneOk = pending.account_type === "pro_live" ? await verifyHash(data.phoneOtp || "", pending.phone_otp_hash) : true;
+  if (pending.account_type !== "pro_live") return res.status(410).json({ error: "Demo signup is no longer available. Create a Pro account." });
+  const phoneOk = await verifyHash(data.phoneOtp || "", pending.phone_otp_hash);
   if (!emailOk || !phoneOk) return res.status(400).json({ error: "Incorrect OTP. Please enter the latest OTP sent to you." });
 
   const created = await transaction(async client => {
     const existingEmail = await client.query("select id from users where lower(email)=lower($1) and account_type=$2 limit 1", [pending.email, pending.account_type]);
-    if (existingEmail.rows.length) throw new Error(`${pending.account_type === "pro_live" ? "Pro" : "Demo"} account already exists for this email.`);
-    if (pending.account_type === "pro_live") {
-      const existingPhone = await client.query(
-        "select user_id from pro_profiles where lower(phone_code)=lower($1) and lower(phone_number)=lower($2) limit 1",
-        [pending.phone_code, pending.phone_number]
-      );
-      if (existingPhone.rows.length) throw new Error("Pro account already exists for this phone number.");
-    }
+    if (existingEmail.rows.length) throw new Error("Pro account already exists for this email.");
+    const existingPhone = await client.query(
+      "select user_id from pro_profiles where lower(phone_code)=lower($1) and lower(phone_number)=lower($2) limit 1",
+      [pending.phone_code, pending.phone_number]
+    );
+    if (existingPhone.rows.length) throw new Error("Pro account already exists for this phone number.");
 
     const customerNumber = await makeCustomerNumber(client);
     const userResult = await client.query(
       `insert into users (customer_number, account_type, first_name, last_name, country, email, password_hash, email_verified, phone_verified, account_status)
-       values ($1,$2,$3,$4,$5,$6,$7,true,$8,'active')
+       values ($1,$2,$3,$4,$5,$6,$7,true,$8,'pending_payment')
        returning id, customer_number`,
       [customerNumber, pending.account_type, pending.first_name, pending.last_name, pending.country, pending.email, pending.password_hash, pending.account_type === "pro_live"]
     );
@@ -449,21 +526,15 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
 
     await client.query(
       `insert into user_plans (user_id, plan_code, status, demo_started_at, demo_expires_at, pro_started_at)
-       values ($1,$2,'active',
-         case when $2='starter_demo' then now() else null end,
-         case when $2='starter_demo' then now() + interval '2 days' else null end,
-         case when $2='pro_live' then now() else null end
-       )`,
-      [user.id, pending.account_type]
+       values ($1,'pro_live','pending_payment',null,null,null)`,
+      [user.id]
     );
 
-    if (pending.account_type === "pro_live") {
-      await client.query(
-        `insert into pro_profiles (user_id, date_of_birth, phone_code, phone_number, phone_verified)
-         values ($1,$2,$3,$4,true)`,
-        [user.id, pending.date_of_birth, pending.phone_code, pending.phone_number]
-      );
-    }
+    await client.query(
+      `insert into pro_profiles (user_id, date_of_birth, phone_code, phone_number, phone_verified)
+       values ($1,$2,$3,$4,true)`,
+      [user.id, pending.date_of_birth, pending.phone_code, pending.phone_number]
+    );
 
     await client.query("insert into client_profiles (user_id) values ($1)", [user.id]);
     await client.query("insert into client_bot_setups (user_id) values ($1)", [user.id]);
@@ -540,6 +611,73 @@ app.post("/auth/verify-login-otp", asyncRoute(async (req, res) => {
   res.json({ token: issueToken(data.userId) });
 }));
 
+app.get("/payments/status", auth, asyncRoute(async (req, res) => {
+  const result = await query(
+    "select payment_status, paid_at from client_profiles where user_id=$1",
+    [req.userId]
+  );
+  const payment = result.rows[0] || { payment_status: "not_started", paid_at: null };
+  res.json({
+    plan: "pro_live",
+    amount: 100,
+    currency: "USD",
+    interval: "month",
+    status: payment.payment_status,
+    paidAt: payment.paid_at,
+    checkoutConfigured: Boolean(stripe)
+  });
+}));
+
+app.post("/payments/checkout", auth, asyncRoute(async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Payments are not configured yet. Add STRIPE_SECRET_KEY in Render." });
+  const userResult = await query(
+    `select u.id,u.email,u.customer_number,p.payment_status
+     from users u join client_profiles p on p.user_id=u.id
+     where u.id=$1 and u.account_type='pro_live'`,
+    [req.userId]
+  );
+  const user = userResult.rows[0];
+  if (!user) return res.status(404).json({ error: "Pro account not found." });
+  if (user.payment_status === "active") return res.json({ active: true, redirectUrl: `${publicFrontendUrl}/portal.html` });
+
+  const lineItem = process.env.STRIPE_PRICE_ID
+    ? { price: process.env.STRIPE_PRICE_ID, quantity: 1 }
+    : {
+        price_data: {
+          currency: "usd",
+          unit_amount: 10000,
+          recurring: { interval: "month" },
+          product_data: { name: "Zukunft Trading Pro" }
+        },
+        quantity: 1
+      };
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer_email: user.email,
+    client_reference_id: user.id,
+    line_items: [lineItem],
+    success_url: `${publicFrontendUrl}/payment.html?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${publicFrontendUrl}/payment.html?cancelled=1`,
+    metadata: { userId: user.id, customerNumber: user.customer_number, plan: "pro_live" },
+    subscription_data: { metadata: { userId: user.id, plan: "pro_live" } }
+  });
+  await query(
+    `update client_profiles set payment_status='pending', stripe_checkout_session_id=$2, updated_at=now() where user_id=$1`,
+    [req.userId, session.id]
+  );
+  res.status(201).json({ checkoutUrl: session.url });
+}));
+
+app.post("/payments/confirm", auth, asyncRoute(async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Payments are not configured." });
+  const data = z.object({ sessionId: z.string().min(8) }).parse(req.body);
+  const session = await stripe.checkout.sessions.retrieve(data.sessionId);
+  const sessionUserId = session.client_reference_id || session.metadata?.userId;
+  if (sessionUserId !== req.userId) return res.status(403).json({ error: "Payment session does not belong to this account." });
+  const active = await activatePaymentFromCheckout(session);
+  res.json({ active, status: active ? "active" : session.payment_status });
+}));
+
 app.get("/me", auth, asyncRoute(async (req, res) => {
   const result = await query(
     `select u.id,u.customer_number,u.first_name,u.last_name,u.email,u.country,u.created_at,u.account_status,
@@ -561,14 +699,14 @@ app.get("/me", auth, asyncRoute(async (req, res) => {
   res.json({ user: result.rows[0] });
 }));
 
-app.get("/onboarding/status", auth, asyncRoute(async (req, res) => {
+app.get("/onboarding/status", auth, requireActivePayment, asyncRoute(async (req, res) => {
   await query("insert into client_bot_setups (user_id) values ($1) on conflict (user_id) do nothing", [req.userId]);
   const result = await query("select * from client_bot_setups where user_id=$1", [req.userId]);
   const setup = result.rows[0];
   res.json({ setup, setupComplete: setupComplete(setup) });
 }));
 
-app.post("/onboarding/api-keys", auth, asyncRoute(async (req, res) => {
+app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (req, res) => {
   const data = apiKeySchema.parse(req.body);
   const [binance, coinalyze] = await Promise.all([
     verifyBinanceFutures(data.binanceApiKey, data.binanceApiSecret).catch(err => ({
@@ -611,7 +749,7 @@ app.post("/onboarding/api-keys", auth, asyncRoute(async (req, res) => {
   });
 }));
 
-app.post("/onboarding/capital", auth, asyncRoute(async (req, res) => {
+app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (req, res) => {
   const data = capitalSchema.parse(req.body);
   const result = await query(
     `insert into client_bot_setups (user_id, capital_amount, capital_currency, updated_at)
@@ -633,7 +771,7 @@ app.post("/onboarding/capital", auth, asyncRoute(async (req, res) => {
   res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
 }));
 
-app.post("/bot/toggle", auth, asyncRoute(async (req, res) => {
+app.post("/bot/toggle", auth, requireActivePayment, asyncRoute(async (req, res) => {
   const data = botToggleSchema.parse(req.body);
   await query("insert into client_bot_setups (user_id) values ($1) on conflict (user_id) do nothing", [req.userId]);
   const current = await query("select * from client_bot_setups where user_id=$1", [req.userId]);
