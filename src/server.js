@@ -22,6 +22,7 @@ const frontendOrigins = String(process.env.FRONTEND_ORIGIN || "http://localhost:
   .map(origin => origin.trim())
   .filter(Boolean);
 const publicFrontendUrl = String(process.env.PUBLIC_FRONTEND_URL || frontendOrigins.find(origin => origin !== "null") || "http://localhost:5500").replace(/\/$/, "");
+let legacyAccountCleanup = { applied: false, deletedUsers: null, remainingUsers: null };
 
 app.set("trust proxy", 1);
 app.use(cors({
@@ -224,6 +225,29 @@ async function ensureRuntimeSchema() {
   await query(`alter table client_profiles add column if not exists stripe_subscription_id text`);
   await query(`alter table client_profiles add column if not exists stripe_checkout_session_id text`);
   await query(`alter table client_profiles add column if not exists paid_at timestamptz`);
+  legacyAccountCleanup = await transaction(async client => {
+    await client.query(`
+      create table if not exists system_migrations (
+        key text primary key,
+        applied_at timestamptz not null default now(),
+        details jsonb not null default '{}'::jsonb
+      )
+    `);
+    await client.query("select pg_advisory_xact_lock(hashtext($1))", ["purge_legacy_accounts_20261001"]);
+    const existing = await client.query("select details from system_migrations where key=$1", ["purge_legacy_accounts_20261001"]);
+    if (existing.rows.length) return { applied: true, ...existing.rows[0].details };
+
+    const before = await client.query("select count(*)::int as count from users");
+    await client.query("delete from pending_signups");
+    await client.query("delete from users");
+    const after = await client.query("select count(*)::int as count from users");
+    const details = { deletedUsers: before.rows[0].count, remainingUsers: after.rows[0].count };
+    await client.query(
+      "insert into system_migrations (key,details) values ($1,$2::jsonb)",
+      ["purge_legacy_accounts_20261001", JSON.stringify(details)]
+    );
+    return { applied: true, ...details };
+  });
 }
 
 async function activatePaymentFromCheckout(session) {
@@ -362,7 +386,7 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/health/db", async (req, res) => {
   try {
     const result = await query("select now() as server_time");
-    res.json({ ok: true, serverTime: result.rows[0].server_time });
+    res.json({ ok: true, serverTime: result.rows[0].server_time, legacyAccountCleanup });
   } catch (err) {
     res.status(500).json({
       ok: false,
