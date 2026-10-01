@@ -200,6 +200,35 @@ function issueToken(userId) {
 
 async function ensureRuntimeSchema() {
   await query(`
+    do $$
+    declare
+      constraint_name text;
+    begin
+      for constraint_name in
+        select conname
+        from pg_constraint
+        where conrelid = 'pending_signups'::regclass
+          and contype = 'c'
+          and pg_get_constraintdef(oid) ilike '%phone_otp_hash IS NOT NULL%'
+      loop
+        execute format('alter table pending_signups drop constraint %I', constraint_name);
+      end loop;
+
+      if not exists (
+        select 1 from pg_constraint
+        where conrelid = 'pending_signups'::regclass
+          and conname = 'pending_signups_account_fields_check'
+      ) then
+        alter table pending_signups
+          add constraint pending_signups_account_fields_check check (
+            (account_type = 'starter_demo' and date_of_birth is null and phone_code is null and phone_number is null and phone_otp_hash is null)
+            or
+            (account_type = 'pro_live' and date_of_birth is not null and phone_code is not null and phone_number is not null)
+          );
+      end if;
+    end $$
+  `);
+  await query(`
     create table if not exists client_bot_setups (
       user_id uuid primary key references users(id) on delete cascade,
       binance_status text not null default 'not_connected',
@@ -381,7 +410,7 @@ async function findUser(identifier) {
   return result.rows[0];
 }
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true, phoneOtpConfigured: hasSmsConfig() }));
 
 app.get("/health/db", async (req, res) => {
   try {
@@ -444,9 +473,7 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
   if (!data.dob || !data.phoneCode || !data.phone) {
     return res.status(400).json({ error: "Pro account requires date of birth, phone extension and mobile number." });
   }
-  if (!hasSmsConfig()) {
-    return res.status(503).json({ error: "Phone OTP service is not configured. Pro signup needs SMS verification before account creation." });
-  }
+  const phoneOtpEnabled = hasSmsConfig();
 
   const existingEmail = await query("select id from users where lower(email)=$1 and account_type=$2 limit 1", [data.email, data.accountType]);
   if (existingEmail.rows.length) return res.status(409).json({ error: "Pro account already exists for this email." });
@@ -469,7 +496,7 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
 
   const passwordHash = await hash(data.password);
   const emailOtp = makeOtp();
-  const phoneOtp = makeOtp();
+  const phoneOtp = phoneOtpEnabled ? makeOtp() : null;
   const result = await query(
     `insert into pending_signups
       (account_type, first_name, last_name, country, email, password_hash, date_of_birth, phone_code, phone_number,
@@ -500,7 +527,7 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
       firstName: data.firstName,
       purpose: "pro_live_signup"
     });
-    await sendPhoneOtp({ to: `${phoneCode}${data.phone}`, code: phoneOtp });
+    if (phoneOtpEnabled) await sendPhoneOtp({ to: `${phoneCode}${data.phone}`, code: phoneOtp });
   } catch (err) {
     await query("delete from pending_signups where id=$1", [pending.id]);
     return res.status(503).json({ error: err.message });
@@ -510,7 +537,7 @@ app.post("/auth/signup", asyncRoute(async (req, res) => {
     email: pending.email,
     accountType: "pro_live",
     emailOtpSent: true,
-    phoneOtpSent: true
+    phoneOtpSent: phoneOtpEnabled
   });
 }));
 
@@ -527,7 +554,7 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
 
   const emailOk = await verifyHash(data.emailOtp, pending.email_otp_hash);
   if (pending.account_type !== "pro_live") return res.status(410).json({ error: "Demo signup is no longer available. Create a Pro account." });
-  const phoneOk = await verifyHash(data.phoneOtp || "", pending.phone_otp_hash);
+  const phoneOk = pending.phone_otp_hash ? await verifyHash(data.phoneOtp || "", pending.phone_otp_hash) : true;
   if (!emailOk || !phoneOk) return res.status(400).json({ error: "Incorrect OTP. Please enter the latest OTP sent to you." });
 
   const created = await transaction(async client => {
@@ -544,7 +571,7 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
       `insert into users (customer_number, account_type, first_name, last_name, country, email, password_hash, email_verified, phone_verified, account_status)
        values ($1,$2,$3,$4,$5,$6,$7,true,$8,'pending_payment')
        returning id, customer_number`,
-      [customerNumber, pending.account_type, pending.first_name, pending.last_name, pending.country, pending.email, pending.password_hash, pending.account_type === "pro_live"]
+      [customerNumber, pending.account_type, pending.first_name, pending.last_name, pending.country, pending.email, pending.password_hash, Boolean(pending.phone_otp_hash)]
     );
     const user = userResult.rows[0];
 
@@ -556,8 +583,8 @@ app.post("/auth/verify-signup", asyncRoute(async (req, res) => {
 
     await client.query(
       `insert into pro_profiles (user_id, date_of_birth, phone_code, phone_number, phone_verified)
-       values ($1,$2,$3,$4,true)`,
-      [user.id, pending.date_of_birth, pending.phone_code, pending.phone_number]
+       values ($1,$2,$3,$4,$5)`,
+      [user.id, pending.date_of_birth, pending.phone_code, pending.phone_number, Boolean(pending.phone_otp_hash)]
     );
 
     await client.query("insert into client_profiles (user_id) values ($1)", [user.id]);

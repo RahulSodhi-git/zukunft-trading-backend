@@ -61,12 +61,40 @@ create table if not exists pending_signups (
   last_otp_sent_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  check (
+  constraint pending_signups_account_fields_check check (
     (account_type = 'starter_demo' and date_of_birth is null and phone_code is null and phone_number is null and phone_otp_hash is null)
     or
-    (account_type = 'pro_live' and date_of_birth is not null and phone_code is not null and phone_number is not null and phone_otp_hash is not null)
+    (account_type = 'pro_live' and date_of_birth is not null and phone_code is not null and phone_number is not null)
   )
 );
+
+do $$
+declare
+  constraint_name text;
+begin
+  for constraint_name in
+    select conname
+    from pg_constraint
+    where conrelid = 'pending_signups'::regclass
+      and contype = 'c'
+      and pg_get_constraintdef(oid) ilike '%phone_otp_hash IS NOT NULL%'
+  loop
+    execute format('alter table pending_signups drop constraint %I', constraint_name);
+  end loop;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'pending_signups'::regclass
+      and conname = 'pending_signups_account_fields_check'
+  ) then
+    alter table pending_signups
+      add constraint pending_signups_account_fields_check check (
+        (account_type = 'starter_demo' and date_of_birth is null and phone_code is null and phone_number is null and phone_otp_hash is null)
+        or
+        (account_type = 'pro_live' and date_of_birth is not null and phone_code is not null and phone_number is not null)
+      );
+  end if;
+end $$;
 
 create table if not exists plans (
   code text primary key,

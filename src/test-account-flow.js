@@ -1,4 +1,5 @@
 import bcrypt from "bcryptjs";
+import assert from "node:assert/strict";
 import jwt from "jsonwebtoken";
 import { app } from "./server.js";
 import { pool, query } from "./db.js";
@@ -50,6 +51,8 @@ const server = app.listen(0, async () => {
   const port = server.address().port;
   const email = `flow-${Date.now()}@example.com`;
   const expiredEmail = `expired-${Date.now()}@example.com`;
+  const deferredPhoneEmail = `deferred-phone-${Date.now()}@example.com`;
+  const signupEmail = `signup-no-sms-${Date.now()}@example.com`;
   let exitCode = 0;
 
   try {
@@ -57,6 +60,39 @@ const server = app.listen(0, async () => {
     const wrongPro = await post(port, "/auth/verify-signup", { signupRequestId: proId, emailOtp: "222222", phoneOtp: "000000" });
     const afterWrongPro = await query("select count(*)::int as count from users where email=$1 and account_type='pro_live'", [email]);
     const rightPro = await post(port, "/auth/verify-signup", { signupRequestId: proId, emailOtp: "222222", phoneOtp: "333333" });
+
+    const deferredPhoneId = await createPending({ email: deferredPhoneEmail, emailOtp: "666666" });
+    const deferredPhoneResult = await post(port, "/auth/verify-signup", { signupRequestId: deferredPhoneId, emailOtp: "666666", phoneOtp: "" });
+    const deferredPhoneUser = await query(
+      `select u.phone_verified as user_phone_verified, p.phone_verified as profile_phone_verified
+       from users u join pro_profiles p on p.user_id=u.id where u.email=$1`,
+      [deferredPhoneEmail]
+    );
+    assert.equal(deferredPhoneResult.status, 200);
+    assert.equal(deferredPhoneUser.rows[0].user_phone_verified, false);
+    assert.equal(deferredPhoneUser.rows[0].profile_phone_verified, false);
+
+    const previousEmailMode = process.env.EMAIL_DELIVERY_MODE;
+    const previousSmsWebhook = process.env.SMS_WEBHOOK_URL;
+    process.env.EMAIL_DELIVERY_MODE = "console";
+    delete process.env.SMS_WEBHOOK_URL;
+    const signupWithoutSms = await post(port, "/auth/signup", {
+      accountType: "pro_live",
+      firstName: "No",
+      lastName: "Sms",
+      dob: "2000-01-01",
+      country: "Germany",
+      email: signupEmail,
+      phoneCode: "+49",
+      phone: String(1800000000 + Math.floor(Math.random() * 999999)),
+      password: "Password1"
+    });
+    if (previousEmailMode === undefined) delete process.env.EMAIL_DELIVERY_MODE;
+    else process.env.EMAIL_DELIVERY_MODE = previousEmailMode;
+    if (previousSmsWebhook === undefined) delete process.env.SMS_WEBHOOK_URL;
+    else process.env.SMS_WEBHOOK_URL = previousSmsWebhook;
+    assert.equal(signupWithoutSms.status, 201);
+    assert.equal(signupWithoutSms.body.phoneOtpSent, false);
 
     const expiredId = await createPending({ email: expiredEmail, emailOtp: "444444", phoneOtp: "555555" });
     await query("update pending_signups set expires_at=now()-interval '1 second' where id=$1", [expiredId]);
@@ -79,6 +115,10 @@ const server = app.listen(0, async () => {
       proUsersAfterWrongPhone: afterWrongPro.rows[0].count,
       proStatus: rightPro.status,
       proCustomer: rightPro.body.customerNumber,
+      deferredPhoneStatus: deferredPhoneResult.status,
+      deferredPhoneVerified: deferredPhoneUser.rows[0].profile_phone_verified,
+      signupWithoutSmsStatus: signupWithoutSms.status,
+      signupWithoutSmsPhoneOtpSent: signupWithoutSms.body.phoneOtpSent,
       expiredStatus: expiredResult.status,
       legacyDemoRejectedStatus: demoResult.status,
       paymentStatus: paymentStatus.status,
@@ -90,8 +130,8 @@ const server = app.listen(0, async () => {
     exitCode = 1;
     console.error(err);
   } finally {
-    await query("delete from users where email in ($1,$2)", [email, expiredEmail]);
-    await query("delete from pending_signups where email in ($1,$2)", [email, expiredEmail]);
+    await query("delete from users where email in ($1,$2,$3)", [email, expiredEmail, deferredPhoneEmail]);
+    await query("delete from pending_signups where email in ($1,$2,$3,$4)", [email, expiredEmail, deferredPhoneEmail, signupEmail]);
     await new Promise(resolve => server.close(resolve));
     await pool.end();
     process.exit(exitCode);

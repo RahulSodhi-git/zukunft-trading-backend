@@ -37,7 +37,7 @@ npm run dev
 The API runs at `http://localhost:5050`.
 
 OTP codes are sent by email through SMTP. They are never returned to the frontend or shown on the account form.
-Pro phone OTP requires `SMS_WEBHOOK_URL` before Pro signup can be used.
+When `SMS_WEBHOOK_URL` is configured, Pro signup also verifies the phone by SMS. Without it, signup continues with email verification and stores the phone as unverified.
 
 For local testing without SMTP, set this in `.env`:
 
