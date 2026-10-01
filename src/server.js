@@ -422,7 +422,12 @@ async function findUser(identifier) {
   return result.rows[0];
 }
 
-app.get("/health", (req, res) => res.json({ ok: true, phoneOtpConfigured: hasSmsConfig() }));
+app.get("/health", (req, res) => res.json({
+  ok: true,
+  phoneOtpConfigured: hasSmsConfig(),
+  paymentProvider: "paypal",
+  paypalConfigured: hasPayPalConfig()
+}));
 
 app.get("/health/db", async (req, res) => {
   try {
