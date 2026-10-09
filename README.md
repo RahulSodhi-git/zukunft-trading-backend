@@ -53,6 +53,16 @@ Run the account-flow verification test:
 npm run test:account
 ```
 
+## One pre-activated setup account
+
+For portal development, create or refresh the single owner setup account with:
+
+```powershell
+npm run account:setup
+```
+
+The command uses `SETUP_ACCOUNT_EMAIL` when configured, otherwise `SMTP_USER`, generates a strong password when `SETUP_ACCOUNT_PASSWORD` is not set, and prints the credentials once. It marks only this database record as paid and active; it does not add a public payment-bypass route. Normal customer accounts still require a completed PayPal capture.
+
 ## Live deployment notes
 
 Deploy this backend separately from the frontend. Good beginner options are Render, Railway, or a VPS.

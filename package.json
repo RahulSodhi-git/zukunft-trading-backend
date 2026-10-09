@@ -10,6 +10,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "db:migrate": "node src/migrate.js",
+    "account:setup": "node src/create-setup-account.js",
     "test:account": "node src/test-account-flow.js",
     "test:paypal": "node src/test-paypal-flow.js"
   },
