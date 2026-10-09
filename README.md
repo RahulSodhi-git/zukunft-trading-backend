@@ -63,6 +63,8 @@ npm run account:setup
 
 The command uses `SETUP_ACCOUNT_EMAIL` when configured, otherwise `SMTP_USER`, generates a strong password when `SETUP_ACCOUNT_PASSWORD` is not set, and prints the credentials once. It marks only this database record as paid and active; it does not add a public payment-bypass route. Normal customer accounts still require a completed PayPal capture.
 
+The server also contains a one-time production migration for `ZT-SETUP-001`. On the first Render deployment containing that migration, it creates the same pre-activated owner record in the live database. The migration is recorded in `system_migrations` and will not create additional accounts on later restarts.
+
 ## Live deployment notes
 
 Deploy this backend separately from the frontend. Good beginner options are Render, Railway, or a VPS.
