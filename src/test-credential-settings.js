@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import express from "express";
-import { registerCredentialSettings, checkReplacement } from "./credential-settings.js";
+import { registerCredentialSettings, checkReplacement, connectionStatus } from "./credential-settings.js";
 
 const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 3072 });
 process.env.WORKER_PUBLIC_KEY_B64 = Buffer.from(publicKey.export({type:"spki",format:"pem"})).toString("base64");
@@ -51,6 +51,11 @@ async function request(path,user,body,extra={}) {
 }
 const credentials = {binanceApiKey:"valid-key-0123456789012345",binanceApiSecret:"secret-0123456789012345"};
 try {
+  assert.equal(connectionStatus({binance_status:"verified",coinalyze_status:"verified"}).connectionsComplete,false,
+    "Legacy verification without stored keys must not enable navigation");
+  const savedBoth = {binance_status:"verified",coinalyze_status:"verified",binance_ciphertext:"encrypted",coinalyze_ciphertext:"encrypted",capital_amount:null};
+  assert.equal(connectionStatus(savedBoth).connectionsComplete,true,"Capital is not required to finish API setup");
+  assert.equal(connectionStatus({...savedBoth,coinalyze_status:"failed"}).connectionsComplete,false);
   assert.equal((await request("/onboarding/binance",id(1),credentials,{"x-test-user":""})).status,401);
   assert.equal((await request("/onboarding/binance",id(1),credentials,{"x-test-paid":"no"})).status,403);
   assert.equal((await request("/settings/binance",id(1),credentials)).status,409);

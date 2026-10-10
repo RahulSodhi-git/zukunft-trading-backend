@@ -20,6 +20,13 @@ export function checkReplacement(row, provider, settingsOnly = false) {
   }
 }
 
+export function connectionStatus(row) {
+  const binanceConnected = Boolean(row?.binance_ciphertext) && row?.binance_status === "verified";
+  const coinalyzeConnected = Boolean(row?.coinalyze_ciphertext) && row?.coinalyze_status === "verified";
+  // API setup is independent of capital, worker provisioning and trade execution.
+  return { binanceConnected, coinalyzeConnected, connectionsComplete: binanceConnected && coinalyzeConnected };
+}
+
 async function connectionRow(query, userId, lock = false) {
   const result = await query(`select s.*,c.binance_ciphertext,c.coinalyze_ciphertext,c.credential_version,
     x.credential_version as snapshot_version,x.actual_state,x.heartbeat_at,coalesce(jsonb_array_length(x.open_positions),0) as open_count
@@ -38,7 +45,7 @@ export function registerCredentialSettings({ app, query, transaction, auth, requ
       try { checkReplacement(row, provider); } catch { canReplace = false; }
     }
     res.json({ connections: {
-      binanceConnected: Boolean(row?.binance_ciphertext), coinalyzeConnected: Boolean(row?.coinalyze_ciphertext),
+      ...connectionStatus(row),
       canReplace, message: canReplace ? "Enter new keys to replace an existing connection. Saved keys are never displayed."
         : "Pause entries and wait for all positions to close before replacing keys."
     } });
