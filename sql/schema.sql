@@ -196,6 +196,32 @@ create table if not exists client_bot_setups (
   check (capital_amount is null or capital_amount >= 50)
 );
 
+alter table client_bot_setups add column if not exists desired_state text not null default 'paused';
+alter table client_bot_setups add column if not exists provisioning_status text not null default 'waiting';
+alter table client_bot_setups add column if not exists assigned_worker_id text;
+alter table client_bot_setups add column if not exists worker_heartbeat_at timestamptz;
+
+create table if not exists client_bot_credentials (
+  user_id uuid primary key references users(id) on delete cascade,
+  binance_ciphertext text,
+  coinalyze_ciphertext text,
+  credential_version integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists client_bot_snapshots (
+  user_id uuid primary key references users(id) on delete cascade,
+  worker_id text,
+  actual_state text not null default 'stopped',
+  open_positions jsonb not null default '[]'::jsonb,
+  recent_closed_trades jsonb not null default '[]'::jsonb,
+  last_error text,
+  heartbeat_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists country_options (
   name text primary key,
   is_default boolean not null default false,

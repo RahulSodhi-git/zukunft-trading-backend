@@ -8,6 +8,12 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { query, transaction } from "./db.js";
 import { hasSmsConfig, sendAccountCreatedEmail, sendOtpEmail, sendPhoneOtp } from "./mailer.js";
+import {
+  ensureWorkerSchema,
+  reconcileProvisioning,
+  registerWorkerPlatform,
+  storeWorkerCredential
+} from "./worker-platform.js";
 
 dotenv.config();
 
@@ -267,6 +273,7 @@ async function ensureRuntimeSchema() {
   await query(`alter table client_profiles add column if not exists paid_at timestamptz`);
   await query(`alter table client_profiles add column if not exists paypal_order_id text`);
   await query(`alter table client_profiles add column if not exists paypal_capture_id text`);
+  await ensureWorkerSchema(query);
   await query(`
     create table if not exists system_migrations (
       key text primary key,
@@ -838,7 +845,8 @@ app.get("/me", auth, asyncRoute(async (req, res) => {
             p.payment_status,p.onboarding_step,p.risk_level,
             s.binance_status,s.binance_message,s.binance_checked_at,
             s.coinalyze_status,s.coinalyze_message,s.coinalyze_checked_at,
-            s.capital_amount,s.capital_currency,s.bot_status,s.bot_status_updated_at,s.setup_completed_at
+            s.capital_amount,s.capital_currency,s.bot_status,s.bot_status_updated_at,s.setup_completed_at,
+            s.desired_state,s.provisioning_status,s.assigned_worker_id,s.worker_heartbeat_at
      from users u
      left join user_plans up on up.user_id=u.id
      left join pro_profiles pp on pp.user_id=u.id
@@ -870,6 +878,16 @@ app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (r
     }))
   ]);
 
+  if (binance.status === "verified") {
+    await storeWorkerCredential(query, req.userId, "binance", {
+      apiKey: data.binanceApiKey,
+      apiSecret: data.binanceApiSecret
+    });
+  }
+  if (coinalyze.status === "verified") {
+    await storeWorkerCredential(query, req.userId, "coinalyze", { apiKey: data.coinalyzeApiKey });
+  }
+
   const result = await query(
     `insert into client_bot_setups
       (user_id, binance_status, binance_message, binance_checked_at, coinalyze_status, coinalyze_message, coinalyze_checked_at, updated_at)
@@ -893,10 +911,12 @@ app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (r
     [req.userId, binance.status, binance.message, coinalyze.status, coinalyze.message]
   );
 
+  await reconcileProvisioning(query, req.userId);
+
   res.json({
     setup: result.rows[0],
     setupComplete: setupComplete(result.rows[0]),
-    note: "API keys were verified and discarded. Zukunft Trading does not store Binance or Coinalyze keys."
+    note: "Connections verified. Credentials are encrypted for the isolated customer worker."
   });
 }));
 
@@ -906,6 +926,12 @@ app.post("/onboarding/binance", auth, requireActivePayment, asyncRoute(async (re
     status: "failed",
     message: cleanProviderMessage(err.message, "Binance connection check failed.")
   }));
+  if (binance.status === "verified") {
+    await storeWorkerCredential(query, req.userId, "binance", {
+      apiKey: data.binanceApiKey,
+      apiSecret: data.binanceApiSecret
+    });
+  }
   const result = await query(
     `insert into client_bot_setups
       (user_id,binance_status,binance_message,binance_checked_at,updated_at)
@@ -925,10 +951,11 @@ app.post("/onboarding/binance", auth, requireActivePayment, asyncRoute(async (re
      returning *`,
     [req.userId, binance.status, binance.message]
   );
+  await reconcileProvisioning(query, req.userId);
   res.json({
     setup: result.rows[0],
     setupComplete: setupComplete(result.rows[0]),
-    note: "Binance credentials were checked and discarded. Zukunft Trading does not store them."
+    note: "Binance verified and encrypted for the isolated customer worker."
   });
 }));
 
@@ -938,6 +965,9 @@ app.post("/onboarding/coinalyze", auth, requireActivePayment, asyncRoute(async (
     status: "failed",
     message: cleanProviderMessage(err.message, "Coinalyze connection check failed.")
   }));
+  if (coinalyze.status === "verified") {
+    await storeWorkerCredential(query, req.userId, "coinalyze", { apiKey: data.coinalyzeApiKey });
+  }
   const result = await query(
     `insert into client_bot_setups
       (user_id,coinalyze_status,coinalyze_message,coinalyze_checked_at,updated_at)
@@ -957,10 +987,11 @@ app.post("/onboarding/coinalyze", auth, requireActivePayment, asyncRoute(async (
      returning *`,
     [req.userId, coinalyze.status, coinalyze.message]
   );
+  await reconcileProvisioning(query, req.userId);
   res.json({
     setup: result.rows[0],
     setupComplete: setupComplete(result.rows[0]),
-    note: "Coinalyze credentials were checked and discarded. Zukunft Trading does not store them."
+    note: "Coinalyze verified and encrypted for the isolated customer worker."
   });
 }));
 
@@ -983,6 +1014,7 @@ app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (re
      returning *`,
     [req.userId, data.capitalAmount]
   );
+  await reconcileProvisioning(query, req.userId);
   res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
 }));
 
@@ -1002,6 +1034,8 @@ app.post("/bot/toggle", auth, requireActivePayment, asyncRoute(async (req, res) 
   );
   res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
 }));
+
+registerWorkerPlatform({ app, query, auth, requireActivePayment, asyncRoute });
 
 app.use((err, req, res, next) => {
   if (err instanceof z.ZodError) return res.status(400).json({ error: err.errors[0]?.message || "Invalid input", details: err.errors });

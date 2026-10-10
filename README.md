@@ -12,7 +12,7 @@ The backend handles the complete Pro onboarding gate:
 - API verification, capital setup and bot controls require an active payment.
 - Customer numbers use `AyyyymmddNN` based on the Europe/Berlin business date.
 - Passwords are stored as bcrypt hashes, never as plain text.
-- Binance API keys are not stored in the database.
+- Exchange credentials are stored only as RSA-OAEP ciphertext; the private decryption key remains on the Oracle worker.
 - Only one signup OTP request is allowed per email every 2 minutes.
 - OTP codes expire after 2 minutes. A wrong OTP does not create an account; the same latest OTP can still be retried until it expires.
 
@@ -89,6 +89,8 @@ ACCOUNT_EMAIL_DELAY_MS=60000
 PAYPAL_MODE=sandbox
 PAYPAL_CLIENT_ID=client_id_from_paypal_developer_dashboard
 PAYPAL_CLIENT_SECRET=client_secret_from_paypal_developer_dashboard
+WORKER_TOKEN=long-random-worker-only-secret
+WORKER_PUBLIC_KEY_B64=base64-encoded-worker-public-key-pem
 ```
 
 After deployment, point the frontend API to:
@@ -107,4 +109,6 @@ Start with `PAYPAL_MODE=sandbox` and sandbox credentials. After PayPal approves 
 - `pro_profiles`: Pro-only fields, created only for Pro users.
 - `otp_codes`: hashed email, phone and login OTPs.
 - `client_profiles`: payment state and PayPal order/capture references. Legacy Stripe columns remain for database compatibility.
-- `client_bot_setups`: API connection status, capital and bot state. API secrets are never stored.
+- `client_bot_setups`: API connection, provisioning, desired worker state and capital.
+- `client_bot_credentials`: RSA-encrypted credential payloads. Plaintext credentials are never stored.
+- `client_bot_snapshots`: worker heartbeat, open positions and recent exchange results for the customer interface.
