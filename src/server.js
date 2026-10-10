@@ -478,6 +478,7 @@ async function findUser(identifier) {
 app.get("/health", (req, res) => res.json({
   ok: true,
   binanceVerification: "oracle-encrypted-queue-v1",
+  release: process.env.RENDER_GIT_COMMIT || null,
   phoneOtpConfigured: hasSmsConfig(),
   paymentProvider: "paypal",
   paypalConfigured: hasPayPalConfig()
