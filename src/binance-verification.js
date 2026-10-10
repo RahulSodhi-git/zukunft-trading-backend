@@ -7,8 +7,10 @@ export async function verifyViaWorker(query, apiKey, apiSecret, options = {}) {
   const wait = options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const attempts = options.attempts ?? 30;
   const saved = await query("select details from system_migrations where key='binance_request_cooldown'");
-  const retryAt = Number(saved.rows[0]?.details?.retryAt || 0);
-  if (Date.now() < retryAt) return { status:'failed', message:`Binance cooldown. Retry after ${new Date(retryAt).toISOString()}. No verification request was sent; your existing keys are unchanged.` };
+  // Preserve the previously reported ban even if it was only held in the old
+  // process memory. This migration must not be used to evade a provider ban.
+  const retryAt = Math.max(1791665443441, Number(saved.rows[0]?.details?.retryAt || 0));
+  if ((options.now || Date.now)() < retryAt) return { status:'failed', message:`Binance cooldown. Retry after ${new Date(retryAt).toISOString()}. No verification request was sent; your existing keys are unchanged.` };
   const id = crypto.randomUUID();
   const ciphertext = encryptForWorker({ apiKey, apiSecret });
   await query('insert into binance_verification_jobs (id,ciphertext) values ($1,$2)', [id,ciphertext]);
