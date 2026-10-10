@@ -5,6 +5,7 @@ const heartbeatSchema = z.object({
   workerId: z.string().trim().min(1).max(80),
   accounts: z.array(z.object({
     userId: z.string().uuid(),
+    credentialVersion: z.number().int().nonnegative(),
     actualState: z.enum(["provisioning", "paused", "running", "stopped", "error"]),
     error: z.string().max(500).nullable().optional(),
     openPositions: z.array(z.record(z.unknown())).max(100).default([]),
@@ -67,6 +68,7 @@ export async function ensureWorkerSchema(query) {
   await query(`alter table client_bot_setups add column if not exists provisioning_status text not null default 'waiting'`);
   await query(`alter table client_bot_setups add column if not exists assigned_worker_id text`);
   await query(`alter table client_bot_setups add column if not exists worker_heartbeat_at timestamptz`);
+  await query(`alter table client_bot_snapshots add column if not exists credential_version integer not null default 0`);
 }
 
 export async function storeWorkerCredential(query, userId, provider, credential) {
@@ -139,27 +141,34 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
 
   app.post("/worker/heartbeat", workerAuth, asyncRoute(async (req, res) => {
     const data = heartbeatSchema.parse(req.body);
+    let accepted = 0;
     for (const account of data.accounts) {
-      await query(
+      const version = await query("select credential_version from client_bot_credentials where user_id=$1", [account.userId]);
+      if (Number(version.rows[0]?.credential_version) !== account.credentialVersion) continue;
+      const saved = await query(
         `insert into client_bot_snapshots
-          (user_id,worker_id,actual_state,open_positions,recent_closed_trades,last_error,heartbeat_at,updated_at)
-         values ($1,$2,$3,$4::jsonb,$5::jsonb,$6,now(),now())
+          (user_id,worker_id,actual_state,open_positions,recent_closed_trades,last_error,credential_version,heartbeat_at,updated_at)
+         select $1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,now(),now()
+         where exists (select 1 from client_bot_credentials where user_id=$1 and credential_version=$7)
          on conflict (user_id) do update set
            worker_id=excluded.worker_id,actual_state=excluded.actual_state,
            open_positions=excluded.open_positions,recent_closed_trades=excluded.recent_closed_trades,
-           last_error=excluded.last_error,heartbeat_at=now(),updated_at=now()`,
+           last_error=excluded.last_error,credential_version=excluded.credential_version,heartbeat_at=now(),updated_at=now()`,
         [account.userId, data.workerId, account.actualState, JSON.stringify(account.openPositions),
-          JSON.stringify(account.recentClosedTrades), account.error || null]
+          JSON.stringify(account.recentClosedTrades), account.error || null, account.credentialVersion]
       );
+      if (saved.rowCount === 0) continue;
       await query(
         `update client_bot_setups set assigned_worker_id=$2,worker_heartbeat_at=now(),
            provisioning_status=case when $3='error' then 'error' else 'ready' end,
            bot_status=case when $3='running' then 'running' else 'stopped' end,
-           updated_at=now() where user_id=$1`,
-        [account.userId, data.workerId, account.actualState]
+           updated_at=now() where user_id=$1
+           and exists (select 1 from client_bot_credentials where user_id=$1 and credential_version=$4)`,
+        [account.userId, data.workerId, account.actualState, account.credentialVersion]
       );
+      accepted++;
     }
-    res.json({ accepted: data.accounts.length });
+    res.json({ accepted });
   }));
 
   app.get("/bot/overview", auth, requireActivePayment, asyncRoute(async (req, res) => {
@@ -179,16 +188,18 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
   app.post("/bot/control", auth, requireActivePayment, asyncRoute(async (req, res) => {
     const data = controlSchema.parse(req.body);
     const current = await query(
-      `select s.*,x.heartbeat_at,coalesce(jsonb_array_length(x.open_positions),0) as open_count
+      `select s.*,x.heartbeat_at,x.credential_version as snapshot_version,c.credential_version,
+       coalesce(jsonb_array_length(x.open_positions),0) as open_count
        from client_bot_setups s left join client_bot_snapshots x on x.user_id=s.user_id
+       left join client_bot_credentials c on c.user_id=s.user_id
        where s.user_id=$1`,
       [req.userId]
     );
     const setup = current.rows[0];
-    if (!setup || setup.provisioning_status !== "ready") {
+    if (!setup || (data.action !== "pause" && setup.provisioning_status !== "ready")) {
       return res.status(409).json({ error: "The customer worker is not ready yet." });
     }
-    if (data.action !== "pause" && (!setup.heartbeat_at || Date.now() - new Date(setup.heartbeat_at).getTime() > 90000)) {
+    if (data.action !== "pause" && (setup.credential_version !== setup.snapshot_version || !setup.heartbeat_at || Date.now() - new Date(setup.heartbeat_at).getTime() > 90000)) {
       return res.status(409).json({ error: "Worker information is stale. Pause remains available; start/stop require a fresh exchange snapshot." });
     }
     if (data.action === "stop" && Number(setup.open_count || 0) > 0) {

@@ -7,6 +7,7 @@ import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { query, transaction } from "./db.js";
+import { registerCredentialSettings } from "./credential-settings.js";
 import { hasSmsConfig, sendAccountCreatedEmail, sendOtpEmail, sendPhoneOtp } from "./mailer.js";
 import {
   ensureWorkerSchema,
@@ -36,6 +37,7 @@ app.use(cors({
   }
 }));
 
+app.use("/worker", express.json({ limit: "2mb" }));
 app.use(express.json({ limit: "64kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 40 }));
 
@@ -892,135 +894,11 @@ app.get("/onboarding/status", auth, requireActivePayment, asyncRoute(async (req,
   res.json({ setup, setupComplete: setupComplete(setup) });
 }));
 
-app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (req, res) => {
-  const data = apiKeySchema.parse(req.body);
-  const [binance, coinalyze] = await Promise.all([
-    verifyBinanceFutures(data.binanceApiKey, data.binanceApiSecret).catch(err => ({
-      status: "failed",
-      message: cleanProviderMessage(err.message, "Binance connection check failed.")
-    })),
-    verifyCoinalyze(data.coinalyzeApiKey).catch(err => ({
-      status: "failed",
-      message: cleanProviderMessage(err.message, "Coinalyze connection check failed.")
-    }))
-  ]);
+app.post("/onboarding/api-keys", auth, requireActivePayment, (req, res) => {
+  res.status(410).json({ error: "Connect or update each service separately using /onboarding/binance and /onboarding/coinalyze." });
+});
 
-  if (binance.status === "verified") {
-    await storeWorkerCredential(query, req.userId, "binance", {
-      apiKey: data.binanceApiKey,
-      apiSecret: data.binanceApiSecret
-    });
-  }
-  if (coinalyze.status === "verified") {
-    await storeWorkerCredential(query, req.userId, "coinalyze", { apiKey: data.coinalyzeApiKey });
-  }
-
-  const result = await query(
-    `insert into client_bot_setups
-      (user_id, binance_status, binance_message, binance_checked_at, coinalyze_status, coinalyze_message, coinalyze_checked_at, updated_at)
-     values ($1,$2,$3,now(),$4,$5,now(),now())
-     on conflict (user_id) do update set
-       binance_status=excluded.binance_status,
-       binance_message=excluded.binance_message,
-       binance_checked_at=excluded.binance_checked_at,
-       coinalyze_status=excluded.coinalyze_status,
-       coinalyze_message=excluded.coinalyze_message,
-       coinalyze_checked_at=excluded.coinalyze_checked_at,
-       setup_completed_at=case
-         when excluded.binance_status='verified'
-          and excluded.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 100
-         then coalesce(client_bot_setups.setup_completed_at, now())
-         else null
-       end,
-       updated_at=now()
-     returning *`,
-    [req.userId, binance.status, binance.message, coinalyze.status, coinalyze.message]
-  );
-
-  await reconcileProvisioning(query, req.userId);
-
-  res.json({
-    setup: result.rows[0],
-    setupComplete: setupComplete(result.rows[0]),
-    note: "Connections verified. Credentials are encrypted for the isolated customer worker."
-  });
-}));
-
-app.post("/onboarding/binance", auth, requireActivePayment, asyncRoute(async (req, res) => {
-  const data = binanceKeySchema.parse(req.body);
-  const binance = await verifyBinanceFutures(data.binanceApiKey, data.binanceApiSecret).catch(err => ({
-    status: "failed",
-    message: cleanProviderMessage(err.message, "Binance connection check failed.")
-  }));
-  if (binance.status === "verified") {
-    await storeWorkerCredential(query, req.userId, "binance", {
-      apiKey: data.binanceApiKey,
-      apiSecret: data.binanceApiSecret
-    });
-  }
-  const result = await query(
-    `insert into client_bot_setups
-      (user_id,binance_status,binance_message,binance_checked_at,updated_at)
-     values ($1,$2,$3,now(),now())
-     on conflict (user_id) do update set
-       binance_status=excluded.binance_status,
-       binance_message=excluded.binance_message,
-       binance_checked_at=excluded.binance_checked_at,
-       setup_completed_at=case
-         when excluded.binance_status='verified'
-          and client_bot_setups.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 100
-         then coalesce(client_bot_setups.setup_completed_at,now())
-         else null
-       end,
-       updated_at=now()
-     returning *`,
-    [req.userId, binance.status, binance.message]
-  );
-  await reconcileProvisioning(query, req.userId);
-  res.json({
-    setup: result.rows[0],
-    setupComplete: setupComplete(result.rows[0]),
-    note: "Binance verified and encrypted for the isolated customer worker."
-  });
-}));
-
-app.post("/onboarding/coinalyze", auth, requireActivePayment, asyncRoute(async (req, res) => {
-  const data = coinalyzeKeySchema.parse(req.body);
-  const coinalyze = await verifyCoinalyze(data.coinalyzeApiKey).catch(err => ({
-    status: "failed",
-    message: cleanProviderMessage(err.message, "Coinalyze connection check failed.")
-  }));
-  if (coinalyze.status === "verified") {
-    await storeWorkerCredential(query, req.userId, "coinalyze", { apiKey: data.coinalyzeApiKey });
-  }
-  const result = await query(
-    `insert into client_bot_setups
-      (user_id,coinalyze_status,coinalyze_message,coinalyze_checked_at,updated_at)
-     values ($1,$2,$3,now(),now())
-     on conflict (user_id) do update set
-       coinalyze_status=excluded.coinalyze_status,
-       coinalyze_message=excluded.coinalyze_message,
-       coinalyze_checked_at=excluded.coinalyze_checked_at,
-       setup_completed_at=case
-         when client_bot_setups.binance_status='verified'
-          and excluded.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 100
-         then coalesce(client_bot_setups.setup_completed_at,now())
-         else null
-       end,
-       updated_at=now()
-     returning *`,
-    [req.userId, coinalyze.status, coinalyze.message]
-  );
-  await reconcileProvisioning(query, req.userId);
-  res.json({
-    setup: result.rows[0],
-    setupComplete: setupComplete(result.rows[0]),
-    note: "Coinalyze verified and encrypted for the isolated customer worker."
-  });
-}));
+registerCredentialSettings({ app, query, transaction, auth, requireActivePayment, asyncRoute, verifyBinanceFutures, verifyCoinalyze });
 
 app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (req, res) => {
   const data = capitalSchema.parse(req.body);
@@ -1054,7 +932,7 @@ registerWorkerPlatform({ app, query, auth, requireActivePayment, asyncRoute });
 app.use((err, req, res, next) => {
   if (err instanceof z.ZodError) return res.status(400).json({ error: err.errors[0]?.message || "Invalid input", details: err.errors });
   console.error(err);
-  res.status(500).json({ error: "Server error" });
+  res.status(err.status || 500).json({ error: err.status ? err.message : "Server error" });
 });
 
 export { app };
