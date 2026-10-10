@@ -103,10 +103,12 @@ const loginSchema = z.object({
 });
 
 const apiKeySchema = z.object({
-  binanceApiKey: z.string().trim().min(16),
-  binanceApiSecret: z.string().trim().min(16),
-  coinalyzeApiKey: z.string().trim().min(12)
+  binanceApiKey: z.string().trim().min(16, "Binance API key is too short."),
+  binanceApiSecret: z.string().trim().min(16, "Binance secret key is too short."),
+  coinalyzeApiKey: z.string().trim().min(12, "Coinalyze API key is too short.")
 });
+const binanceKeySchema = apiKeySchema.pick({ binanceApiKey: true, binanceApiSecret: true });
+const coinalyzeKeySchema = apiKeySchema.pick({ coinalyzeApiKey: true });
 
 const capitalSchema = z.object({
   capitalAmount: z.coerce.number().min(50)
@@ -898,6 +900,70 @@ app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (r
   });
 }));
 
+app.post("/onboarding/binance", auth, requireActivePayment, asyncRoute(async (req, res) => {
+  const data = binanceKeySchema.parse(req.body);
+  const binance = await verifyBinanceFutures(data.binanceApiKey, data.binanceApiSecret).catch(err => ({
+    status: "failed",
+    message: cleanProviderMessage(err.message, "Binance connection check failed.")
+  }));
+  const result = await query(
+    `insert into client_bot_setups
+      (user_id,binance_status,binance_message,binance_checked_at,updated_at)
+     values ($1,$2,$3,now(),now())
+     on conflict (user_id) do update set
+       binance_status=excluded.binance_status,
+       binance_message=excluded.binance_message,
+       binance_checked_at=excluded.binance_checked_at,
+       setup_completed_at=case
+         when excluded.binance_status='verified'
+          and client_bot_setups.coinalyze_status='verified'
+          and client_bot_setups.capital_amount >= 50
+         then coalesce(client_bot_setups.setup_completed_at,now())
+         else null
+       end,
+       updated_at=now()
+     returning *`,
+    [req.userId, binance.status, binance.message]
+  );
+  res.json({
+    setup: result.rows[0],
+    setupComplete: setupComplete(result.rows[0]),
+    note: "Binance credentials were checked and discarded. Zukunft Trading does not store them."
+  });
+}));
+
+app.post("/onboarding/coinalyze", auth, requireActivePayment, asyncRoute(async (req, res) => {
+  const data = coinalyzeKeySchema.parse(req.body);
+  const coinalyze = await verifyCoinalyze(data.coinalyzeApiKey).catch(err => ({
+    status: "failed",
+    message: cleanProviderMessage(err.message, "Coinalyze connection check failed.")
+  }));
+  const result = await query(
+    `insert into client_bot_setups
+      (user_id,coinalyze_status,coinalyze_message,coinalyze_checked_at,updated_at)
+     values ($1,$2,$3,now(),now())
+     on conflict (user_id) do update set
+       coinalyze_status=excluded.coinalyze_status,
+       coinalyze_message=excluded.coinalyze_message,
+       coinalyze_checked_at=excluded.coinalyze_checked_at,
+       setup_completed_at=case
+         when client_bot_setups.binance_status='verified'
+          and excluded.coinalyze_status='verified'
+          and client_bot_setups.capital_amount >= 50
+         then coalesce(client_bot_setups.setup_completed_at,now())
+         else null
+       end,
+       updated_at=now()
+     returning *`,
+    [req.userId, coinalyze.status, coinalyze.message]
+  );
+  res.json({
+    setup: result.rows[0],
+    setupComplete: setupComplete(result.rows[0]),
+    note: "Coinalyze credentials were checked and discarded. Zukunft Trading does not store them."
+  });
+}));
+
 app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (req, res) => {
   const data = capitalSchema.parse(req.body);
   const result = await query(
@@ -938,7 +1004,7 @@ app.post("/bot/toggle", auth, requireActivePayment, asyncRoute(async (req, res) 
 }));
 
 app.use((err, req, res, next) => {
-  if (err instanceof z.ZodError) return res.status(400).json({ error: "Invalid input", details: err.errors });
+  if (err instanceof z.ZodError) return res.status(400).json({ error: err.errors[0]?.message || "Invalid input", details: err.errors });
   console.error(err);
   res.status(500).json({ error: "Server error" });
 });
