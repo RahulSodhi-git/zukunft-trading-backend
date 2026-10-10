@@ -51,6 +51,7 @@ export function registerCredentialSettings({ app, query, transaction, auth, requ
     }
     res.json({ connections: {
       ...connectionStatus(row),
+      binanceAccount: connectionStatus(row).binanceConnected ? row.binance_account_summary || null : null,
       canReplace, message: canReplace ? "Enter new keys to replace an existing connection. Saved keys are never displayed."
         : "Pause entries and wait for all positions to close before replacing keys."
     } });
@@ -68,10 +69,10 @@ export function registerCredentialSettings({ app, query, transaction, auth, requ
             ? await verifyBinanceFutures(input.binanceApiKey, input.binanceApiSecret)
             : await verifyCoinalyze(input.coinalyzeApiKey);
         } catch {
-          return res.status(502).json({ error: "Connection verification unavailable. Existing credentials are unchanged." });
+          return res.status(502).json({ error: "Could not load account information. Existing credentials are unchanged." });
         }
         if (verified.status !== "verified") {
-          return res.status(400).json({ error: verified.message || "Verification failed. Existing credentials are unchanged." });
+          return res.status(400).json({ error: verified.message || "Failed to connect. Check your API key and secret. Existing credentials are unchanged." });
         }
         const setup = await transaction(async client => {
           const tx = (sql, values) => client.query(sql, values);
@@ -81,8 +82,11 @@ export function registerCredentialSettings({ app, query, transaction, auth, requ
             ? { apiKey: input.binanceApiKey, apiSecret: input.binanceApiSecret } : { apiKey: input.coinalyzeApiKey });
           const result = await tx(`update client_bot_setups set ${provider}_status='verified',
             ${provider}_message=$2,${provider}_checked_at=now(),desired_state='paused',
-            provisioning_status='pending',updated_at=now() where user_id=$1 returning *`,
-            [req.userId, "Verified; credentials encrypted for the customer worker."]);
+            provisioning_status='pending',updated_at=now()
+            ${provider === 'binance' ? ',binance_account_summary=$3::jsonb' : ''}
+            where user_id=$1 returning *`,
+            [req.userId, "Connected; keys saved encrypted.",
+              ...(provider === 'binance' ? [JSON.stringify(verified.account || null)] : [])]);
           return result.rows[0];
         });
         res.json({ setup, note: "Connection saved encrypted. The worker will load the new keys; entries remain paused until you start." });

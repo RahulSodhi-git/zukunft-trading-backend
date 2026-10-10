@@ -23,6 +23,7 @@ async function query(sql, values) {
   } else if (sql.startsWith("update client_bot_setups set")) {
     const provider = sql.includes("binance_status") ? "binance" : "coinalyze";
     Object.assign(row,{[`${provider}_status`]:"verified",desired_state:"paused",provisioning_status:"pending"});
+    if(provider==='binance')row.binance_account_summary=JSON.parse(values[2]);
     // Real returning * contains no credentials: credentials are in a separate table.
     return {rows:[{user_id:user,[`${provider}_status`]:"verified",desired_state:"paused"}]};
   } else throw new Error("Unrecognized test query");
@@ -35,7 +36,7 @@ const paid = (req,res,next) => req.headers["x-test-paid"]==="yes" ? next() : res
 const verify = async key => {
   verifications++;
   if (race) rows.get(id(1)).desired_state="running";
-  return key.startsWith("invalid") ? {status:"failed",message:"Invalid replacement key"} : {status:"verified"};
+  return key.startsWith("invalid") ? {status:"failed",message:"Invalid replacement key"} : {status:"verified",account:{walletBalance:'123.45',availableBalance:'100',canTrade:false,unit:'USDT',loadedAt:new Date().toISOString()}};
 };
 registerCredentialSettings({ app,query,transaction:fn=>fn({query}),auth,requireActivePayment:paid,
   asyncRoute:fn=>(req,res,next)=>Promise.resolve(fn(req,res)).catch(next),
@@ -65,6 +66,9 @@ try {
   const initial=await request("/onboarding/binance",id(1),credentials);
   assert.equal(initial.status,200);
   assert.ok(!initial.text.includes(credentials.binanceApiSecret));
+  const connected=await request('/settings/connections',id(1));
+  assert.equal(connected.data.connections.binanceAccount.walletBalance,'123.45');
+  assert.equal(connected.data.connections.binanceAccount.canTrade,false);
   const decrypt=value=>JSON.parse(crypto.privateDecrypt({key:privateKey,oaepHash:"sha256",padding:crypto.constants.RSA_PKCS1_OAEP_PADDING},Buffer.from(value,"base64")));
   assert.equal(decrypt(rows.get(id(1)).binance_ciphertext).apiSecret,credentials.binanceApiSecret);
   Object.assign(rows.get(id(1)),fresh());

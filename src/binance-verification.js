@@ -20,7 +20,7 @@ export async function verifyViaWorker(query, apiKey, apiSecret, options = {}) {
       const response = await query('select result from binance_verification_jobs where id=$1', [id]);
       if (response.rows[0]?.result) return response.rows[0].result;
     }
-    return { status:'failed', message:'The secure Binance verifier is busy or unavailable. Your keys were not saved. Please try again later.' };
+    return { status:'failed', message:'Could not load your Binance account: the connection service is busy or unavailable. Your keys were not saved. Please try again later.' };
   } finally {
     await query('delete from binance_verification_jobs where id=$1', [id]);
   }

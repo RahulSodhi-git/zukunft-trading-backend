@@ -38,10 +38,13 @@ try {
     assert.equal(decoded.apiSecret,'fake-secret');
     assert.equal((await (await request('/worker/verification')).json()).job,null,'Claim once only');
     assert.equal((await request(`/worker/verification/${claimed.id}`,{status:'verified',message:'Verified'},false)).status,401);
-    await request(`/worker/verification/${claimed.id}`,{status:'verified',message:'Verified'});
+    assert.equal((await request(`/worker/verification/${claimed.id}`,{status:'verified',message:'Connected',account:{walletBalance:'123.45',availableBalance:'100',canTrade:false,unit:'USDT',loadedAt:new Date().toISOString(),apiSecret:'not-allowed'}})).status,400);
+    await request(`/worker/verification/${claimed.id}`,{status:'verified',message:'Connected',account:{walletBalance:'123.45',availableBalance:'100',canTrade:false,unit:'USDT',loadedAt:new Date().toISOString()}});
     assert.equal(job.ciphertext,null,'Erase transient keys after completion');
   }});
   assert.equal(verified.status,'verified');
+  assert.equal(verified.account.walletBalance,'123.45');
+  assert.equal(verified.account.canTrade,false,'Readable accounts connect independently of trading permission');
   assert.equal(job,null);
   assert.equal((await verifyViaWorker(query,'fake-key','fake-secret',{now:()=>now,attempts:1,wait:async()=>{}})).status,'failed');
   assert.equal(job,null,'Erase transient keys on timeout');

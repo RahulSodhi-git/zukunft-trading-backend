@@ -74,6 +74,7 @@ export async function ensureWorkerSchema(query) {
   await query(`alter table client_bot_setups add column if not exists assigned_worker_id text`);
   await query(`alter table client_bot_setups add column if not exists worker_heartbeat_at timestamptz`);
   await query(`alter table client_bot_snapshots add column if not exists credential_version integer not null default 0`);
+  await query(`alter table client_bot_setups add column if not exists binance_account_summary jsonb`);
 }
 
 export async function storeWorkerCredential(query, userId, provider, credential) {
@@ -135,7 +136,11 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
   }));
   app.post('/worker/verification/:id', workerAuth, asyncRoute(async (req, res) => {
     const id = z.string().uuid().parse(req.params.id);
-    const result = z.object({ status:z.enum(['verified','failed']), message:z.string().max(500) }).strict().parse(req.body);
+    const amount = z.string().max(80).regex(/^-?\d+(\.\d+)?$/);
+    const result = z.object({ status:z.enum(['verified','failed']), message:z.string().max(500),
+      account:z.object({ walletBalance:amount, availableBalance:amount, canTrade:z.boolean(),
+        unit:z.enum(['USD','USDT']),loadedAt:z.string().datetime({offset:true}) }).strict().optional()
+    }).strict().parse(req.body);
     await query(`update binance_verification_jobs set status='done',result=$2::jsonb,ciphertext=null
       where id=$1 and status='processing' and expires_at>now()`, [id,JSON.stringify(result)]);
     res.json({ ok:true });
@@ -217,6 +222,9 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
       [req.userId]
     );
     const setup = current.rows[0];
+    if (data.action === "start" && setup?.binance_account_summary?.canTrade === false) {
+      return res.status(409).json({ error: "Your Binance account is connected, but trading is disabled on Binance. Enable the required access before starting." });
+    }
     if (!setup || (data.action !== "pause" && setup.provisioning_status !== "ready")) {
       return res.status(409).json({ error: "The customer worker is not ready yet." });
     }

@@ -47,6 +47,9 @@ try {
  current={...current,heartbeat_at:new Date(),snapshot_version:1};
  assert.equal((await request('/bot/control',{action:'start'})).status,409);
  current={...current,snapshot_version:2,open_count:1};
+ current={...current,binance_account_summary:{canTrade:false}};
+ assert.equal((await request('/bot/control',{action:'start'})).status,409);
+ assert.equal((await request('/bot/control',{action:'pause'})).status,200);
  assert.equal((await request('/bot/control',{action:'stop'})).status,409);
  assert.equal((await request('/bot/control',{action:'pause'})).status,200);
  assert.equal((await request('/worker/heartbeat',{workerId:'pilot',accounts:[{...account,userId:'invalid'}]},{'x-worker-token':process.env.WORKER_TOKEN})).status,400);
