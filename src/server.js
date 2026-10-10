@@ -429,14 +429,18 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   }
 }
 
+// Remember provider bans across deployments and serialize verification requests.
 let binanceRetryAt = 1791665443441;
 let binanceCheckInFlight = false;
 
 async function verifyBinanceFutures(apiKey, apiSecret) {
   const saved = await query("select details from system_migrations where key='binance_request_cooldown'");
   binanceRetryAt = Math.max(binanceRetryAt, Number(saved.rows[0]?.details?.retryAt || 0));
-  if (Date.now() < binanceRetryAt || binanceCheckInFlight) {
+  if (Date.now() < binanceRetryAt) {
     return { status: "failed", message: `Binance server cooldown. Retry after ${new Date(binanceRetryAt).toISOString()}. Your API keys have not been rejected.` };
+  }
+  if (binanceCheckInFlight) {
+    return { status: "failed", message: "Another Binance connection check is in progress. Please wait before retrying." };
   }
   binanceCheckInFlight = true;
   try {
