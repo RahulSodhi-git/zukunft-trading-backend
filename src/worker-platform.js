@@ -96,7 +96,7 @@ export async function reconcileProvisioning(query, userId) {
   const row = result.rows[0];
   const ready = row?.binance_status === "verified"
     && row?.coinalyze_status === "verified"
-    && Number(row?.capital_amount || 0) >= 50
+    && Number(row?.capital_amount || 0) >= 100
     && row?.has_binance
     && row?.has_coinalyze;
   await query(
@@ -129,7 +129,7 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
        where p.payment_status='active'
          and s.binance_status='verified'
          and s.coinalyze_status='verified'
-         and s.capital_amount>=50
+         and s.capital_amount>= 100
          and c.binance_ciphertext is not null
          and c.coinalyze_ciphertext is not null
        order by s.updated_at asc`
@@ -179,7 +179,7 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
   app.post("/bot/control", auth, requireActivePayment, asyncRoute(async (req, res) => {
     const data = controlSchema.parse(req.body);
     const current = await query(
-      `select s.*,coalesce(jsonb_array_length(x.open_positions),0) as open_count
+      `select s.*,x.heartbeat_at,coalesce(jsonb_array_length(x.open_positions),0) as open_count
        from client_bot_setups s left join client_bot_snapshots x on x.user_id=s.user_id
        where s.user_id=$1`,
       [req.userId]
@@ -187,6 +187,9 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
     const setup = current.rows[0];
     if (!setup || setup.provisioning_status !== "ready") {
       return res.status(409).json({ error: "The customer worker is not ready yet." });
+    }
+    if (data.action !== "pause" && (!setup.heartbeat_at || Date.now() - new Date(setup.heartbeat_at).getTime() > 90000)) {
+      return res.status(409).json({ error: "Worker information is stale. Pause remains available; start/stop require a fresh exchange snapshot." });
     }
     if (data.action === "stop" && Number(setup.open_count || 0) > 0) {
       return res.status(409).json({ error: "Pause entries instead. Stop is blocked while exchange positions are open." });

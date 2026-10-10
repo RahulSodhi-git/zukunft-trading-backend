@@ -117,7 +117,7 @@ const binanceKeySchema = apiKeySchema.pick({ binanceApiKey: true, binanceApiSecr
 const coinalyzeKeySchema = apiKeySchema.pick({ coinalyzeApiKey: true });
 
 const capitalSchema = z.object({
-  capitalAmount: z.coerce.number().min(50)
+  capitalAmount: z.coerce.number().min(100)
 });
 
 const botToggleSchema = z.object({
@@ -264,7 +264,7 @@ async function ensureRuntimeSchema() {
       check (binance_status in ('not_connected','verified','failed')),
       check (coinalyze_status in ('not_connected','verified','failed')),
       check (bot_status in ('stopped','running')),
-      check (capital_amount is null or capital_amount >= 50)
+      check (capital_amount is null or capital_amount >= 100)
     )
   `);
   await query(`alter table client_profiles add column if not exists stripe_customer_id text`);
@@ -429,7 +429,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   }
 }
 
+let binanceRetryAt = 1791665443441;
+let binanceCheckInFlight = false;
+
 async function verifyBinanceFutures(apiKey, apiSecret) {
+  const saved = await query("select details from system_migrations where key='binance_request_cooldown'");
+  binanceRetryAt = Math.max(binanceRetryAt, Number(saved.rows[0]?.details?.retryAt || 0));
+  if (Date.now() < binanceRetryAt || binanceCheckInFlight) {
+    return { status: "failed", message: `Binance server cooldown. Retry after ${new Date(binanceRetryAt).toISOString()}. Your API keys have not been rejected.` };
+  }
+  binanceCheckInFlight = true;
+  try {
   const timestamp = Date.now();
   const queryString = `timestamp=${timestamp}&recvWindow=5000`;
   const signature = crypto.createHmac("sha256", apiSecret).update(queryString).digest("hex");
@@ -440,10 +450,23 @@ async function verifyBinanceFutures(apiKey, apiSecret) {
   if (response.ok) return { status: "verified", message: "Binance Futures connection verified. Withdrawal permission is not used." };
   let body = {};
   try { body = await response.json(); } catch {}
+  if (response.status === 418 || response.status === 429) {
+    const reported = /banned until (\d{13})/i.exec(String(body.msg || ""));
+    const retrySeconds = Number(response.headers.get("retry-after"));
+    binanceRetryAt = Math.max(Date.now() + 60000, reported ? Number(reported[1]) : Date.now() + (retrySeconds > 0 ? retrySeconds : 120) * 1000);
+    await query(
+      "insert into system_migrations (key,details) values ('binance_request_cooldown',$1::jsonb) on conflict (key) do update set details=excluded.details",
+      [JSON.stringify({ retryAt: binanceRetryAt })]
+    );
+    return { status: "failed", message: `Binance server cooldown. Retry after ${new Date(binanceRetryAt).toISOString()}. Your API keys have not been rejected.` };
+  }
   return {
     status: "failed",
     message: cleanProviderMessage(body.msg, `Binance rejected the key check with status ${response.status}.`)
   };
+  } finally {
+    binanceCheckInFlight = false;
+  }
 }
 
 async function verifyCoinalyze(apiKey) {
@@ -463,7 +486,7 @@ async function verifyCoinalyze(apiKey) {
 }
 
 function setupComplete(row) {
-  return row?.binance_status === "verified" && row?.coinalyze_status === "verified" && Number(row?.capital_amount || 0) >= 50;
+  return row?.binance_status === "verified" && row?.coinalyze_status === "verified" && Number(row?.capital_amount || 0) >= 100;
 }
 
 async function findUser(identifier) {
@@ -902,7 +925,7 @@ app.post("/onboarding/api-keys", auth, requireActivePayment, asyncRoute(async (r
        setup_completed_at=case
          when excluded.binance_status='verified'
           and excluded.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 50
+          and client_bot_setups.capital_amount >= 100
          then coalesce(client_bot_setups.setup_completed_at, now())
          else null
        end,
@@ -943,7 +966,7 @@ app.post("/onboarding/binance", auth, requireActivePayment, asyncRoute(async (re
        setup_completed_at=case
          when excluded.binance_status='verified'
           and client_bot_setups.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 50
+          and client_bot_setups.capital_amount >= 100
          then coalesce(client_bot_setups.setup_completed_at,now())
          else null
        end,
@@ -979,7 +1002,7 @@ app.post("/onboarding/coinalyze", auth, requireActivePayment, asyncRoute(async (
        setup_completed_at=case
          when client_bot_setups.binance_status='verified'
           and excluded.coinalyze_status='verified'
-          and client_bot_setups.capital_amount >= 50
+          and client_bot_setups.capital_amount >= 100
          then coalesce(client_bot_setups.setup_completed_at,now())
          else null
        end,
@@ -1006,7 +1029,7 @@ app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (re
        setup_completed_at=case
          when client_bot_setups.binance_status='verified'
           and client_bot_setups.coinalyze_status='verified'
-          and excluded.capital_amount >= 50
+          and excluded.capital_amount >= 100
          then coalesce(client_bot_setups.setup_completed_at, now())
          else null
        end,
@@ -1019,20 +1042,7 @@ app.post("/onboarding/capital", auth, requireActivePayment, asyncRoute(async (re
 }));
 
 app.post("/bot/toggle", auth, requireActivePayment, asyncRoute(async (req, res) => {
-  const data = botToggleSchema.parse(req.body);
-  await query("insert into client_bot_setups (user_id) values ($1) on conflict (user_id) do nothing", [req.userId]);
-  const current = await query("select * from client_bot_setups where user_id=$1", [req.userId]);
-  if (data.action === "start" && !setupComplete(current.rows[0])) {
-    return res.status(409).json({ error: "Complete Binance, Coinalyze and minimum 50 USDT capital setup before starting the bot." });
-  }
-  const result = await query(
-    `update client_bot_setups
-     set bot_status=$2, bot_status_updated_at=now(), updated_at=now()
-     where user_id=$1
-     returning *`,
-    [req.userId, data.action === "start" ? "running" : "stopped"]
-  );
-  res.json({ setup: result.rows[0], setupComplete: setupComplete(result.rows[0]) });
+  res.status(410).json({ error: "Use /bot/control. Bot status is reported by the worker, not a database toggle." });
 }));
 
 registerWorkerPlatform({ app, query, auth, requireActivePayment, asyncRoute });

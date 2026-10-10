@@ -193,7 +193,7 @@ create table if not exists client_bot_setups (
   check (binance_status in ('not_connected','verified','failed')),
   check (coinalyze_status in ('not_connected','verified','failed')),
   check (bot_status in ('stopped','running')),
-  check (capital_amount is null or capital_amount >= 50)
+  check (capital_amount is null or capital_amount >= 100)
 );
 
 alter table client_bot_setups add column if not exists desired_state text not null default 'paused';
