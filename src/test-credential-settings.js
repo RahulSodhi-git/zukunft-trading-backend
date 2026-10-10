@@ -56,6 +56,9 @@ try {
   const savedBoth = {binance_status:"verified",coinalyze_status:"verified",binance_ciphertext:"encrypted",coinalyze_ciphertext:"encrypted",capital_amount:null};
   assert.equal(connectionStatus(savedBoth).connectionsComplete,true,"Capital is not required to finish API setup");
   assert.equal(connectionStatus({...savedBoth,coinalyze_status:"failed"}).connectionsComplete,false);
+  assert.doesNotThrow(()=>checkReplacement({binance_ciphertext:"encrypted",desired_state:"paused",capital_amount:null},"binance"),
+    "Initial saved keys can be corrected before the account is eligible for worker provisioning");
+  assert.throws(()=>checkReplacement({binance_ciphertext:"encrypted",desired_state:"paused",capital_amount:100},"binance"));
   assert.equal((await request("/onboarding/binance",id(1),credentials,{"x-test-user":""})).status,401);
   assert.equal((await request("/onboarding/binance",id(1),credentials,{"x-test-paid":"no"})).status,403);
   assert.equal((await request("/settings/binance",id(1),credentials)).status,409);

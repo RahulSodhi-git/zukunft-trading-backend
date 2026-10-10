@@ -12,6 +12,11 @@ export function checkReplacement(row, provider, settingsOnly = false) {
     throw Object.assign(new Error("Connect this service during initial setup first."), { status: 409 });
   }
   if (!exists) return;
+  // Before capital is configured, this account cannot be selected by /worker/accounts.
+  // Permit correcting an initial saved key without requiring a worker that has never run.
+  if (row.desired_state !== "running" && Number(row.capital_amount || 0) < 100
+      && !row.assigned_worker_id && !row.worker_heartbeat_at && !row.heartbeat_at
+      && !row.actual_state && Number(row.open_count || 0) === 0) return;
   const age = Date.now() - new Date(row.heartbeat_at || 0).getTime();
   if (row.desired_state === "running" || !["paused", "stopped"].includes(row.actual_state)
       || row.credential_version !== row.snapshot_version
