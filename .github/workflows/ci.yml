@@ -20,5 +20,6 @@ jobs:
       - run: npm ci
       - run: node --check src/server.js
       - run: node src/test-binance-cooldown.js
+      - run: node src/test-binance-verification.js
       - run: node src/test-credential-settings.js
       - run: node src/test-worker-platform.js

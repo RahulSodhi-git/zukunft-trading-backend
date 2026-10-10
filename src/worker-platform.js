@@ -27,7 +27,7 @@ function workerPublicKey() {
   }
 }
 
-function encryptForWorker(value) {
+export function encryptForWorker(value) {
   return crypto.publicEncrypt(
     { key: workerPublicKey(), oaepHash: "sha256", padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
     Buffer.from(JSON.stringify(value), "utf8")
@@ -41,6 +41,11 @@ function safeEqual(value, expected) {
 }
 
 export async function ensureWorkerSchema(query) {
+  await query(`create table if not exists binance_verification_jobs (
+    id uuid primary key, ciphertext text, status text not null default 'pending',
+    result jsonb, created_at timestamptz not null default now(),
+    expires_at timestamptz not null default now() + interval '45 seconds'
+  )`);
   await query(`
     create table if not exists client_bot_credentials (
       user_id uuid primary key references users(id) on delete cascade,
@@ -119,6 +124,22 @@ export function registerWorkerPlatform({ app, query, auth, requireActivePayment,
     }
     next();
   }
+
+  app.get('/worker/verification', workerAuth, asyncRoute(async (req, res) => {
+    await query("delete from binance_verification_jobs where expires_at < now()");
+    const result = await query(`update binance_verification_jobs set status='processing'
+      where id=(select id from binance_verification_jobs where status='pending'
+        and expires_at>now() order by created_at for update skip locked limit 1)
+      returning id,ciphertext`);
+    res.json({ job: result.rows[0] || null });
+  }));
+  app.post('/worker/verification/:id', workerAuth, asyncRoute(async (req, res) => {
+    const id = z.string().uuid().parse(req.params.id);
+    const result = z.object({ status:z.enum(['verified','failed']), message:z.string().max(500) }).strict().parse(req.body);
+    await query(`update binance_verification_jobs set status='done',result=$2::jsonb,ciphertext=null
+      where id=$1 and status='processing' and expires_at>now()`, [id,JSON.stringify(result)]);
+    res.json({ ok:true });
+  }));
 
   app.get("/worker/accounts", workerAuth, asyncRoute(async (req, res) => {
     const result = await query(
