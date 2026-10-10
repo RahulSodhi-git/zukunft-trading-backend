@@ -422,7 +422,21 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   }
 }
 
+// Remember provider bans across deployments and serialize verification requests.
+let binanceRetryAt = 1791665443441;
+let binanceCheckInFlight = false;
+
 async function verifyBinanceFutures(apiKey, apiSecret) {
+  const saved = await query("select details from system_migrations where key='binance_request_cooldown'");
+  binanceRetryAt = Math.max(binanceRetryAt, Number(saved.rows[0]?.details?.retryAt || 0));
+  if (Date.now() < binanceRetryAt) {
+    return { status: "failed", message: `Binance server cooldown. Retry after ${new Date(binanceRetryAt).toISOString()}. Your API keys have not been rejected.` };
+  }
+  if (binanceCheckInFlight) {
+    return { status: "failed", message: "Another Binance connection check is in progress. Please wait before retrying." };
+  }
+  binanceCheckInFlight = true;
+  try {
   const timestamp = Date.now();
   const queryString = `timestamp=${timestamp}&recvWindow=5000`;
   const signature = crypto.createHmac("sha256", apiSecret).update(queryString).digest("hex");
@@ -433,10 +447,23 @@ async function verifyBinanceFutures(apiKey, apiSecret) {
   if (response.ok) return { status: "verified", message: "Binance Futures connection verified. Withdrawal permission is not used." };
   let body = {};
   try { body = await response.json(); } catch {}
+  if (response.status === 418 || response.status === 429) {
+    const reported = /banned until (\d{13})/i.exec(String(body.msg || ""));
+    const retrySeconds = Number(response.headers.get("retry-after"));
+    binanceRetryAt = Math.max(Date.now() + 60000, reported ? Number(reported[1]) : Date.now() + (retrySeconds > 0 ? retrySeconds : 120) * 1000);
+    await query(
+      "insert into system_migrations (key,details) values ('binance_request_cooldown',$1::jsonb) on conflict (key) do update set details=excluded.details",
+      [JSON.stringify({ retryAt: binanceRetryAt })]
+    );
+    return { status: "failed", message: `Binance server cooldown. Retry after ${new Date(binanceRetryAt).toISOString()}. Your API keys have not been rejected.` };
+  }
   return {
     status: "failed",
     message: cleanProviderMessage(body.msg, `Binance rejected the key check with status ${response.status}.`)
   };
+  } finally {
+    binanceCheckInFlight = false;
+  }
 }
 
 async function verifyCoinalyze(apiKey) {
